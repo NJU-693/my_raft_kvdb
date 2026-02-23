@@ -1,0 +1,331 @@
+#include "raft/raft_node.h"
+#include <algorithm>
+
+namespace raft {
+
+RaftNode::RaftNode(int nodeId, const std::vector<int>& peerIds)
+    : currentTerm_(0),
+      votedFor_(-1),
+      commitIndex_(0),
+      lastApplied_(0),
+      nodeId_(nodeId),
+      peerIds_(peerIds),
+      state_(NodeState::FOLLOWER),
+      leaderId_(-1),
+      lastHeartbeatTime_(std::chrono::steady_clock::now()),
+      lastHeartbeatSent_(std::chrono::steady_clock::now()),
+      heartbeatInterval_(HEARTBEAT_INTERVAL),
+      rng_(std::random_device{}()) {
+    
+    // 初始化日志（索引 0 为哨兵）
+    log_.push_back(LogEntry(0, "", 0));
+    
+    // 初始化 Leader 状态（虽然初始为 Follower，但预先分配空间）
+    nextIndex_.resize(peerIds_.size(), 1);
+    matchIndex_.resize(peerIds_.size(), 0);
+    
+    // 生成随机选举超时时间
+    electionTimeout_ = generateElectionTimeout();
+}
+
+RaftNode::~RaftNode() {
+    // 清理资源
+}
+
+// ==================== 状态查询接口 ====================
+
+NodeState RaftNode::getState() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_;
+}
+
+int RaftNode::getCurrentTerm() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return currentTerm_;
+}
+
+int RaftNode::getLeaderId() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return leaderId_;
+}
+
+bool RaftNode::isLeader() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_ == NodeState::LEADER;
+}
+
+// ==================== RPC 处理接口 ====================
+
+void RaftNode::handleRequestVote(const RequestVoteArgs& args, RequestVoteReply& reply) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 初始化响应
+    reply.term = currentTerm_;
+    reply.voteGranted = false;
+    
+    // 规则 1: 如果 term < currentTerm，拒绝投票
+    if (args.term < currentTerm_) {
+        return;
+    }
+    
+    // 规则 2: 如果 term > currentTerm，更新任期并转为 Follower
+    if (args.term > currentTerm_) {
+        currentTerm_ = args.term;
+        votedFor_ = -1;
+        state_ = NodeState::FOLLOWER;
+        leaderId_ = -1;
+        reply.term = currentTerm_;
+    }
+    
+    // 规则 3: 检查投票条件
+    // - 当前任期还未投票，或已经投给了该候选人
+    // - 候选人的日志至少和自己一样新
+    bool canVote = (votedFor_ == -1 || votedFor_ == args.candidateId);
+    bool logUpToDate = isLogUpToDate(args.lastLogIndex, args.lastLogTerm);
+    
+    if (canVote && logUpToDate) {
+        votedFor_ = args.candidateId;
+        reply.voteGranted = true;
+        resetElectionTimer();  // 重置选举超时
+    }
+}
+
+void RaftNode::handleAppendEntries(const AppendEntriesArgs& args, AppendEntriesReply& reply) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 初始化响应
+    reply.term = currentTerm_;
+    reply.success = false;
+    reply.conflictIndex = -1;
+    reply.conflictTerm = -1;
+    
+    // 规则 1: 如果 term < currentTerm，拒绝请求
+    if (args.term < currentTerm_) {
+        return;
+    }
+    
+    // 规则 2: 如果 term >= currentTerm，更新任期并转为 Follower
+    if (args.term >= currentTerm_) {
+        currentTerm_ = args.term;
+        if (state_ != NodeState::FOLLOWER) {
+            state_ = NodeState::FOLLOWER;
+            votedFor_ = -1;
+        }
+        leaderId_ = args.leaderId;
+        resetElectionTimer();  // 重置选举超时
+        reply.term = currentTerm_;
+    }
+    
+    // 规则 3: 检查日志一致性
+    // 如果 prevLogIndex 处的日志不存在或任期不匹配，返回失败
+    if (args.prevLogIndex > 0) {
+        if (args.prevLogIndex >= static_cast<int>(log_.size())) {
+            // 日志不够长
+            reply.conflictIndex = log_.size();
+            reply.conflictTerm = -1;
+            return;
+        }
+        
+        if (log_[args.prevLogIndex].term != args.prevLogTerm) {
+            // 任期不匹配
+            reply.conflictTerm = log_[args.prevLogIndex].term;
+            // 找到该任期的第一个日志索引
+            reply.conflictIndex = args.prevLogIndex;
+            while (reply.conflictIndex > 1 && 
+                   log_[reply.conflictIndex - 1].term == reply.conflictTerm) {
+                reply.conflictIndex--;
+            }
+            return;
+        }
+    }
+    
+    // 规则 4: 如果存在冲突的日志条目，删除它及其后的所有条目
+    int logIndex = args.prevLogIndex + 1;
+    for (size_t i = 0; i < args.entries.size(); ++i) {
+        int currentIndex = logIndex + i;
+        
+        if (currentIndex < static_cast<int>(log_.size())) {
+            // 检查是否冲突
+            if (log_[currentIndex].term != args.entries[i].term) {
+                // 删除冲突的条目及其后的所有条目
+                log_.erase(log_.begin() + currentIndex, log_.end());
+                log_.push_back(args.entries[i]);
+            }
+            // 如果不冲突，跳过（已存在相同的条目）
+        } else {
+            // 追加新条目
+            log_.push_back(args.entries[i]);
+        }
+    }
+    
+    // 规则 5: 更新 commitIndex
+    if (args.leaderCommit > commitIndex_) {
+        commitIndex_ = std::min(args.leaderCommit, getLastLogIndex());
+    }
+    
+    reply.success = true;
+}
+
+// ==================== 状态转换接口 ====================
+
+void RaftNode::startElection() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 转变为 Candidate
+    state_ = NodeState::CANDIDATE;
+    currentTerm_++;
+    votedFor_ = nodeId_;  // 投票给自己
+    leaderId_ = -1;
+    
+    // 重置选举超时
+    resetElectionTimer();
+    
+    // 注意：实际的投票请求发送需要在外部实现（涉及网络通信）
+    // 这里只处理状态转换逻辑
+}
+
+void RaftNode::becomeLeader() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 转变为 Leader
+    state_ = NodeState::LEADER;
+    leaderId_ = nodeId_;
+    
+    // 初始化 nextIndex 和 matchIndex
+    int lastLogIndex = getLastLogIndex();
+    for (size_t i = 0; i < peerIds_.size(); ++i) {
+        nextIndex_[i] = lastLogIndex + 1;
+        matchIndex_[i] = 0;
+    }
+    
+    // 重置心跳计时器
+    resetHeartbeatTimer();
+    
+    // 注意：实际的心跳发送需要在外部实现（涉及网络通信）
+}
+
+void RaftNode::becomeFollower(int term) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 更新任期
+    if (term > currentTerm_) {
+        currentTerm_ = term;
+        votedFor_ = -1;
+    }
+    
+    // 转变为 Follower
+    state_ = NodeState::FOLLOWER;
+    leaderId_ = -1;
+    
+    // 重置选举超时
+    resetElectionTimer();
+}
+
+// ==================== 定时器接口 ====================
+
+bool RaftNode::checkElectionTimeout() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Leader 不需要检查选举超时
+    if (state_ == NodeState::LEADER) {
+        return false;
+    }
+    
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<Duration>(now - lastHeartbeatTime_);
+    return elapsed >= electionTimeout_;
+}
+
+void RaftNode::resetElectionTimer() {
+    // 注意：此方法假设调用者已持有锁
+    lastHeartbeatTime_ = std::chrono::steady_clock::now();
+    electionTimeout_ = generateElectionTimeout();
+}
+
+bool RaftNode::shouldSendHeartbeat() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 只有 Leader 需要发送心跳
+    if (state_ != NodeState::LEADER) {
+        return false;
+    }
+    
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<Duration>(now - lastHeartbeatSent_);
+    return elapsed >= heartbeatInterval_;
+}
+
+void RaftNode::resetHeartbeatTimer() {
+    // 注意：此方法假设调用者已持有锁
+    lastHeartbeatSent_ = std::chrono::steady_clock::now();
+}
+
+// ==================== 日志操作接口 ====================
+
+int RaftNode::appendLogEntry(const std::string& command) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 只有 Leader 可以追加日志
+    if (state_ != NodeState::LEADER) {
+        return -1;
+    }
+    
+    // 创建新的日志条目
+    int index = log_.size();
+    LogEntry entry(currentTerm_, command, index);
+    log_.push_back(entry);
+    
+    return index;
+}
+
+LogEntry RaftNode::getLogEntry(int index) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    if (index < 0 || index >= static_cast<int>(log_.size())) {
+        return LogEntry();  // 返回空的日志条目
+    }
+    
+    return log_[index];
+}
+
+int RaftNode::getLastLogIndex() const {
+    // 注意：此方法假设调用者已持有锁
+    return log_.size() - 1;
+}
+
+int RaftNode::getLastLogTerm() const {
+    // 注意：此方法假设调用者已持有锁
+    if (log_.empty()) {
+        return 0;
+    }
+    return log_.back().term;
+}
+
+int RaftNode::getLogSize() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return log_.size() - 1;  // 减去哨兵节点
+}
+
+// ==================== 私有辅助方法 ====================
+
+RaftNode::Duration RaftNode::generateElectionTimeout() {
+    std::uniform_int_distribution<int> dist(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+    return Duration(dist(rng_));
+}
+
+bool RaftNode::isLogUpToDate(int lastLogIndex, int lastLogTerm) const {
+    // 注意：此方法假设调用者已持有锁
+    
+    int myLastLogIndex = getLastLogIndex();
+    int myLastLogTerm = getLastLogTerm();
+    
+    // 比较规则：
+    // 1. 如果任期不同，任期大的更新
+    // 2. 如果任期相同，索引大的更新
+    if (lastLogTerm != myLastLogTerm) {
+        return lastLogTerm > myLastLogTerm;
+    }
+    return lastLogIndex >= myLastLogIndex;
+}
+
+} // namespace raft
