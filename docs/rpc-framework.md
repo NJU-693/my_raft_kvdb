@@ -2,25 +2,34 @@
 
 ## 概述
 
-本项目实现了一个轻量级的 RPC（远程过程调用）框架，用于 Raft 节点之间的通信。当前实现基于原生 TCP Socket，提供了简单、高效的消息传递机制。
+本项目使用 **gRPC** 作为 Raft 节点之间的 RPC（远程过程调用）框架。gRPC 是一个高性能、开源的通用 RPC 框架，基于 HTTP/2 协议，使用 Protocol Buffers 作为接口定义语言（IDL）和消息序列化格式。
+
+> **注意**: 项目已从 Simple RPC（基于 TCP Socket）升级到 gRPC。如需了解 gRPC 的详细使用说明，请参考 [docs/grpc-guide.md](grpc-guide.md)。
 
 ## 架构设计
 
 ### 核心组件
 
 1. **Protocol Buffers 定义** (`proto/raft.proto`)
-   - 定义了 Raft RPC 消息格式
+   - 定义了 Raft RPC 消息格式和服务接口
    - 包含 RequestVote 和 AppendEntries 两种 RPC
+   - 使用 protoc 编译生成 C++ 代码
 
-2. **RPC 服务端** (`RaftRPCServer`)
-   - 监听指定端口
-   - 接收并处理 RPC 请求
+2. **RPC 服务端** (`GrpcRPCServer`)
+   - 继承 `RaftRPCServer` 接口和 `raft::RaftService::Service`
+   - 监听指定端口，接收并处理 gRPC 请求
    - 调用 RaftNode 的处理方法
+   - 实现 proto 消息和 C++ 对象之间的转换
 
-3. **RPC 客户端** (`RaftRPCClient`)
-   - 连接到远程节点
-   - 发送 RPC 请求
-   - 处理响应和超时
+3. **RPC 客户端** (`GrpcRPCClient`)
+   - 继承 `RaftRPCClient` 接口
+   - 连接到远程节点，发送 gRPC 请求
+   - 处理响应、超时和重试
+   - 实现 C++ 对象和 proto 消息之间的转换
+
+4. **工厂函数** (`rpc_factory.cpp`)
+   - `createRPCServer()`: 创建 gRPC 服务器实例
+   - `createRPCClient()`: 创建 gRPC 客户端实例
 
 ### 消息格式
 
@@ -56,7 +65,7 @@
 
 ## 使用示例
 
-### 启动 RPC 服务器
+### 启动 gRPC 服务器
 
 ```cpp
 #include "network/rpc_server.h"
@@ -66,43 +75,41 @@
 std::vector<int> peerIds = {2, 3};
 auto raftNode = std::make_unique<raft::RaftNode>(1, peerIds);
 
-// 创建并启动 RPC 服务器
+// 创建并启动 gRPC 服务器
 auto server = network::createRPCServer(raftNode.get());
-if (server->start("127.0.0.1:8001")) {
-    std::cout << "RPC Server started successfully" << std::endl;
+if (server->start("0.0.0.0:50051")) {
+    std::cout << "gRPC Server started successfully" << std::endl;
     server->wait();  // 等待服务器关闭
 }
 ```
 
-### 使用 RPC 客户端
+### 使用 gRPC 客户端
 
 ```cpp
 #include "network/rpc_client.h"
 #include "raft/rpc_messages.h"
 
-// 创建 RPC 客户端
-auto client = network::createRPCClient("127.0.0.1:8002");
+// 创建 gRPC 客户端（自动连接）
+auto client = network::createRPCClient("localhost:50051");
 
-// 连接到远程节点
-if (client->connect("127.0.0.1:8002")) {
-    // 发送 RequestVote RPC
-    raft::RequestVoteArgs args(1, 1, 0, 0);
-    raft::RequestVoteReply reply;
-    
-    if (client->sendRequestVote(args, reply, 1000)) {
-        if (reply.voteGranted) {
-            std::cout << "Vote granted!" << std::endl;
-        }
+// 发送 RequestVote RPC
+raft::RequestVoteArgs args(1, 1, 0, 0);
+raft::RequestVoteReply reply;
+
+if (client->sendRequestVote(args, reply, 1000)) {
+    if (reply.voteGranted) {
+        std::cout << "Vote granted!" << std::endl;
     }
-    
-    client->disconnect();
+} else {
+    std::cerr << "RPC failed" << std::endl;
 }
+```
 ```
 
 ### 配置超时和重试
 
 ```cpp
-auto client = network::createRPCClient("127.0.0.1:8002");
+auto client = network::createRPCClient("localhost:50051");
 
 // 设置默认超时时间（毫秒）
 client->setDefaultTimeout(2000);
@@ -116,9 +123,48 @@ raft::AppendEntriesReply reply;
 client->sendAppendEntries(args, reply, 500);  // 500ms 超时
 ```
 
-## Protocol Buffers 语法说明
+## gRPC 实现优势
 
-### 基本语法
+相比之前的 Simple RPC 实现，gRPC 提供了以下优势：
+
+### 1. 性能优势
+- **HTTP/2 协议**: 支持多路复用、头部压缩、服务器推送
+- **高效序列化**: Protocol Buffers 比 JSON/XML 更快、更小
+- **连接复用**: 自动管理连接池，减少连接开销
+
+### 2. 可靠性
+- **成熟稳定**: 经过 Google 和众多公司的生产环境验证
+- **错误处理**: 完善的错误码和状态管理
+- **超时控制**: 精确的超时和截止时间控制
+
+### 3. 可扩展性
+- **跨语言支持**: 支持多种编程语言，便于未来扩展
+- **丰富的工具**: 支持 grpcurl、grpc-gateway 等工具
+- **流式 RPC**: 支持双向流（虽然当前未使用）
+
+### 4. 开发效率
+- **自动代码生成**: 从 .proto 文件自动生成客户端和服务端代码
+- **类型安全**: 编译时类型检查，减少运行时错误
+- **文档化**: .proto 文件本身就是接口文档
+
+## Protocol Buffers 使用说明
+
+### 编译 .proto 文件
+
+当修改 `proto/raft.proto` 后，需要重新编译生成 C++ 代码：
+
+```bash
+cd proto
+protoc --cpp_out=. --grpc_out=. \
+       --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` \
+       raft.proto
+```
+
+这将生成以下文件：
+- `raft.pb.h` / `raft.pb.cc`: Protocol Buffers 消息定义
+- `raft.grpc.pb.h` / `raft.grpc.pb.cc`: gRPC 服务定义
+
+### Proto 文件语法
 
 ```protobuf
 syntax = "proto3";  // 使用 proto3 语法
@@ -146,108 +192,47 @@ service RaftService {
 - `string`: 字符串类型
 - `repeated`: 数组类型（如 `repeated LogEntry entries`）
 
-### 编译 .proto 文件
+## 构建配置
 
-如果要使用 gRPC（可选），需要安装 Protocol Buffers 编译器：
+### CMakeLists.txt 配置
 
+项目已配置好 gRPC 和 Protocol Buffers 的构建：
+
+```cmake
+# 查找 Protobuf
+find_package(Protobuf REQUIRED)
+
+# 查找 gRPC（使用 pkg-config）
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GRPC REQUIRED grpc++)
+
+# 添加 proto 生成的源文件库
+add_library(raft_proto
+    proto/raft.pb.cc
+    proto/raft.grpc.pb.cc
+)
+target_link_libraries(raft_proto PUBLIC
+    ${PROTOBUF_LIBRARIES}
+    ${GRPC_LIBRARIES}
+)
+```
+
+### 安装依赖
+
+**Ubuntu/Debian**:
 ```bash
-# 安装 protoc
-# Ubuntu/Debian
-sudo apt-get install protobuf-compiler
-
-# macOS
-brew install protobuf
-
-# 编译 .proto 文件
-protoc --cpp_out=. --grpc_out=. --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` proto/raft.proto
+sudo apt install libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc
 ```
 
-## 当前实现：Simple RPC
-
-当前实现使用原生 TCP Socket，不依赖 gRPC。这种实现：
-
-### 优点
-- 轻量级，无外部依赖
-- 易于理解和调试
-- 足够满足 Raft 的需求
-
-### 消息协议
-
-**请求格式**: `METHOD|payload`
-- `METHOD`: "RequestVote" 或 "AppendEntries"
-- `payload`: 序列化后的参数
-
-**响应格式**: `OK|payload` 或 `ERROR:message`
-- 成功: `OK|` + 序列化后的响应
-- 失败: `ERROR:` + 错误信息
-
-### 序列化格式
-
-使用简单的文本序列化（在 `rpc_messages.h` 中定义）：
-
-```cpp
-// RequestVoteArgs 序列化
-"term|candidateId|lastLogIndex|lastLogTerm"
-
-// AppendEntriesArgs 序列化
-"term|leaderId|prevLogIndex|prevLogTerm|leaderCommit|entryCount|..."
+**从源码编译** (如果系统包不可用):
+```bash
+git clone --recurse-submodules -b v1.50.0 https://github.com/grpc/grpc
+cd grpc
+mkdir -p cmake/build && cd cmake/build
+cmake ../..
+make -j4
+sudo make install
 ```
-
-## 升级到 gRPC（可选）
-
-如果需要更强大的功能（如流式 RPC、负载均衡等），可以升级到 gRPC：
-
-### 步骤
-
-1. **安装 gRPC 和 Protocol Buffers**
-   ```bash
-   # 参考 https://grpc.io/docs/languages/cpp/quickstart/
-   ```
-
-2. **编译 .proto 文件**
-   ```bash
-   protoc --cpp_out=. --grpc_out=. \
-          --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` \
-          proto/raft.proto
-   ```
-
-3. **实现 gRPC 服务端**
-   ```cpp
-   class RaftServiceImpl final : public raft::RaftService::Service {
-       Status RequestVote(ServerContext* context,
-                         const RequestVoteRequest* request,
-                         RequestVoteResponse* response) override {
-           // 实现逻辑
-           return Status::OK;
-       }
-   };
-   ```
-
-4. **实现 gRPC 客户端**
-   ```cpp
-   auto channel = grpc::CreateChannel("localhost:8001",
-                                     grpc::InsecureChannelCredentials());
-   auto stub = raft::RaftService::NewStub(channel);
-   
-   RequestVoteRequest request;
-   RequestVoteResponse response;
-   ClientContext context;
-   
-   Status status = stub->RequestVote(&context, request, &response);
-   ```
-
-5. **更新 CMakeLists.txt**
-   ```cmake
-   find_package(Protobuf REQUIRED)
-   find_package(gRPC REQUIRED)
-   
-   target_link_libraries(network
-       PUBLIC
-       raft
-       protobuf::libprotobuf
-       gRPC::grpc++
-   )
-   ```
 
 ## 常见问题和调试技巧
 
@@ -257,16 +242,17 @@ protoc --cpp_out=. --grpc_out=. --plugin=protoc-gen-grpc=`which grpc_cpp_plugin`
 
 **解决方案**:
 - 检查服务器是否已启动
-- 检查地址和端口是否正确
+- 检查地址和端口是否正确（gRPC 默认使用 50051 端口）
 - 检查防火墙设置
 - 使用 `netstat` 或 `ss` 查看端口监听状态
 
 ```bash
 # Linux/macOS
-netstat -an | grep 8001
+netstat -an | grep 50051
+ss -tuln | grep 50051
 
-# Windows
-netstat -an | findstr 8001
+# 或使用 lsof
+lsof -i :50051
 ```
 
 ### 2. 超时问题
@@ -277,131 +263,140 @@ netstat -an | findstr 8001
 - 增加超时时间
 - 检查网络延迟
 - 检查服务器负载
-- 使用日志记录请求处理时间
+- 启用 gRPC 日志查看详细信息
 
-```cpp
-// 增加超时时间
-client->setDefaultTimeout(5000);  // 5 秒
-
-// 记录处理时间
-auto start = std::chrono::steady_clock::now();
-client->sendRequestVote(args, reply);
-auto end = std::chrono::steady_clock::now();
-auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-std::cout << "Request took " << duration.count() << "ms" << std::endl;
+```bash
+# 启用 gRPC 详细日志
+export GRPC_VERBOSITY=DEBUG
+export GRPC_TRACE=all
 ```
 
-### 3. 序列化错误
+### 3. 编译错误
 
-**问题**: 消息序列化/反序列化失败
+**问题**: 找不到 gRPC 或 Protobuf 头文件
 
 **解决方案**:
-- 检查消息格式是否正确
-- 确保发送端和接收端使用相同的序列化格式
-- 添加错误处理和日志
+```bash
+# 检查是否安装了开发包
+dpkg -l | grep grpc
+dpkg -l | grep protobuf
 
-```cpp
-try {
-    auto args = raft::RequestVoteArgs::deserialize(payload);
-} catch (const std::exception& e) {
-    std::cerr << "Deserialization error: " << e.what() << std::endl;
-    std::cerr << "Payload: " << payload << std::endl;
-}
+# 重新安装
+sudo apt install libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc
 ```
 
 ### 4. 调试技巧
 
-**启用详细日志**:
-```cpp
-// 在 RPC 服务器中添加日志
-std::cout << "Received " << method << " request from client" << std::endl;
-std::cout << "Payload: " << payload << std::endl;
+**使用 grpcurl 测试服务**:
+```bash
+# 安装 grpcurl
+go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+
+# 列出服务
+grpcurl -plaintext localhost:50051 list
+
+# 调用方法
+grpcurl -plaintext -d '{"term": 1, "candidate_id": 2}' \
+    localhost:50051 raft.RaftService/RequestVote
 ```
 
-**使用网络抓包工具**:
+**查看 gRPC 流量**:
 ```bash
 # 使用 tcpdump 抓包
-sudo tcpdump -i lo -A port 8001
+sudo tcpdump -i lo -w grpc.pcap port 50051
 
-# 使用 Wireshark 分析网络流量
-```
-
-**测试连接**:
-```bash
-# 使用 telnet 测试端口
-telnet 127.0.0.1 8001
-
-# 使用 nc (netcat) 测试
-echo "RequestVote|1|1|0|0" | nc 127.0.0.1 8001
+# 使用 Wireshark 分析（HTTP/2 协议）
 ```
 
 ## 性能优化建议
 
-### 1. 连接池
+### 1. 连接复用
 
-对于频繁通信的节点，维护长连接而不是每次请求都创建新连接：
+gRPC 自动管理连接池和连接复用，无需手动管理：
 
 ```cpp
-class ConnectionPool {
-    std::map<std::string, std::unique_ptr<RaftRPCClient>> clients_;
-    
-public:
-    RaftRPCClient* getClient(const std::string& address) {
-        if (clients_.find(address) == clients_.end()) {
-            clients_[address] = createRPCClient(address);
-            clients_[address]->connect(address);
-        }
-        return clients_[address].get();
-    }
-};
+// gRPC 客户端会自动复用连接
+auto client = network::createRPCClient("localhost:50051");
+
+// 多次调用会复用同一个连接
+for (int i = 0; i < 100; ++i) {
+    client->sendRequestVote(args, reply);
+}
 ```
 
-### 2. 异步 RPC
+### 2. 异步 RPC（未来扩展）
 
-使用异步 RPC 避免阻塞：
+当前实现使用同步 RPC。如需更高性能，可以实现异步版本：
 
 ```cpp
-// 异步发送请求
-std::future<bool> future = std::async(std::launch::async, [&]() {
-    return client->sendRequestVote(args, reply);
-});
-
-// 继续其他工作...
-
-// 等待结果
-if (future.get()) {
-    // 处理响应
-}
+// 未来可能的异步接口
+std::future<RequestVoteReply> sendRequestVoteAsync(const RequestVoteArgs& args);
 ```
 
 ### 3. 批量操作
 
-合并多个小请求为一个大请求，减少网络往返：
+合并多个日志条目为一个 AppendEntries 请求：
 
 ```cpp
-// 在 AppendEntries 中批量发送多个日志条目
+// 批量发送多个日志条目
 std::vector<LogEntry> entries;
 for (int i = 0; i < 10; ++i) {
     entries.push_back(getLogEntry(nextIndex + i));
 }
 args.entries = entries;
+client->sendAppendEntries(args, reply);
+```
+
+### 4. 调整 gRPC 参数
+
+```cpp
+// 在创建 channel 时设置参数
+grpc::ChannelArguments args;
+args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
+args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+
+auto channel = grpc::CreateCustomChannel(
+    address, 
+    grpc::InsecureChannelCredentials(), 
+    args
+);
 ```
 
 ## 参考资料
 
 - [gRPC 官方文档](https://grpc.io/docs/)
+- [gRPC C++ 快速开始](https://grpc.io/docs/languages/cpp/quickstart/)
 - [Protocol Buffers 文档](https://developers.google.com/protocol-buffers)
 - [Raft 论文](https://raft.github.io/raft.pdf)
-- [TCP Socket 编程指南](https://beej.us/guide/bgnet/)
+- [gRPC 性能最佳实践](https://grpc.io/docs/guides/performance/)
 
 ## 总结
 
-本 RPC 框架提供了 Raft 节点间通信所需的基本功能：
+本项目使用 gRPC 作为 RPC 框架，提供了以下功能：
 
 - ✅ RequestVote RPC（请求投票）
 - ✅ AppendEntries RPC（追加日志/心跳）
 - ✅ 超时和重试机制
-- ✅ 消息序列化
-- ✅ 简单易用的接口
+- ✅ 高效的 Protocol Buffers 序列化
+- ✅ HTTP/2 协议支持
+- ✅ 自动连接管理和复用
+- ✅ 完善的错误处理
+- ✅ 跨平台支持
 
-当前的 Simple RPC 实现足够满足 Raft 的需求。如果未来需要更高级的功能（如双向流、负载均衡等），可以无缝升级到 gRPC。
+gRPC 提供了生产级别的性能和可靠性，是构建分布式系统的理想选择。
+
+## 附录：Simple RPC 实现
+
+项目中仍保留了 Simple RPC 实现（`simple_rpc_server.cpp` 和 `simple_rpc_client.cpp`）作为参考。如需切换回 Simple RPC，可以修改 `rpc_factory.cpp` 中的工厂函数。
+
+Simple RPC 的优点：
+- 轻量级，无外部依赖
+- 易于理解和调试
+- 适合学习和原型开发
+
+gRPC 的优点：
+- 生产级别的性能和可靠性
+- 丰富的工具和生态系统
+- 跨语言支持
+- 更好的错误处理和超时控制

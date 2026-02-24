@@ -1,5 +1,6 @@
 #include "raft/raft_node.h"
 #include <algorithm>
+#include <condition_variable>
 
 namespace raft {
 
@@ -498,8 +499,26 @@ void RaftNode::applyCommittedEntriesInternal() {
             const LogEntry& entry = log_[lastApplied_];
             
             // 调用状态机应用回调
+            std::string result = "OK";
             if (applyCallback_) {
-                applyCallback_(entry.command);
+                result = applyCallback_(entry.command);
+            }
+            
+            // 通知等待该命令的客户端
+            std::shared_ptr<PendingCommand> pendingCmd;
+            {
+                std::lock_guard<std::mutex> lock(pendingCommandsMutex_);
+                auto it = pendingCommands_.find(lastApplied_);
+                if (it != pendingCommands_.end()) {
+                    pendingCmd = it->second;
+                }
+            }
+            
+            if (pendingCmd) {
+                std::lock_guard<std::mutex> lock(pendingCmd->mutex);
+                pendingCmd->result = result;
+                pendingCmd->completed = true;
+                pendingCmd->cv.notify_one();
             }
         }
     }
@@ -583,9 +602,109 @@ int RaftNode::getLastApplied() const {
     return lastApplied_;
 }
 
-void RaftNode::setApplyCallback(std::function<void(const std::string&)> callback) {
+void RaftNode::setApplyCallback(std::function<std::string(const std::string&)> callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     applyCallback_ = callback;
+}
+
+// ==================== 客户端请求接口 ====================
+
+bool RaftNode::submitCommand(const std::string& command, std::string& result, int timeout_ms) {
+    // 检查是否为 Leader
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != NodeState::LEADER) {
+            return false;
+        }
+    }
+    
+    // 追加日志条目
+    int logIndex = appendLogEntry(command);
+    if (logIndex < 0) {
+        return false;
+    }
+    
+    // 检查是否是单节点集群
+    bool isSingleNode = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        isSingleNode = (peerIds_.size() == 0);
+        
+        // 如果是单节点集群，立即更新 commitIndex
+        if (isSingleNode) {
+            commitIndex_ = logIndex;
+        }
+    }
+    
+    // 创建待处理命令
+    auto pendingCmd = std::make_shared<PendingCommand>();
+    pendingCmd->logIndex = logIndex;
+    pendingCmd->command = command;
+    pendingCmd->completed = false;
+    
+    {
+        std::lock_guard<std::mutex> lock(pendingCommandsMutex_);
+        pendingCommands_[logIndex] = pendingCmd;
+    }
+    
+    // 如果是单节点集群，立即应用命令
+    if (isSingleNode) {
+        applyCommittedEntries();
+    }
+    
+    // 等待命令被提交和应用
+    std::unique_lock<std::mutex> lock(pendingCmd->mutex);
+    bool success = pendingCmd->cv.wait_for(
+        lock,
+        std::chrono::milliseconds(timeout_ms),
+        [&pendingCmd]() { return pendingCmd->completed; }
+    );
+    
+    if (success) {
+        result = pendingCmd->result;
+    }
+    
+    // 清理待处理命令
+    {
+        std::lock_guard<std::mutex> lock(pendingCommandsMutex_);
+        pendingCommands_.erase(logIndex);
+    }
+    
+    return success;
+}
+
+std::string RaftNode::getNodeAddress() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return nodeAddress_;
+}
+
+void RaftNode::setNodeAddress(const std::string& address) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    nodeAddress_ = address;
+}
+
+std::string RaftNode::getLeaderAddress() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 如果自己是 Leader，返回自己的地址
+    if (state_ == NodeState::LEADER) {
+        return nodeAddress_;
+    }
+    
+    // 如果知道 Leader ID，返回 Leader 地址
+    if (leaderId_ >= 0) {
+        auto it = peerAddresses_.find(leaderId_);
+        if (it != peerAddresses_.end()) {
+            return it->second;
+        }
+    }
+    
+    return "";  // 未知 Leader
+}
+
+void RaftNode::setPeerAddresses(const std::map<int, std::string>& peer_addresses) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    peerAddresses_ = peer_addresses;
 }
 
 // ==================== 私有辅助方法 ====================

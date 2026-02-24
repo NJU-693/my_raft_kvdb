@@ -61,4 +61,35 @@ int KVStore::size() const {
     return store_.getSize();
 }
 
+std::string KVStore::applyCommandWithResult(const std::string& command) {
+    // 反序列化命令
+    Command cmd = Command::deserialize(command);
+    
+    // 根据命令类型执行相应操作
+    switch (cmd.getType()) {
+        case CommandType::PUT: {
+            std::lock_guard<std::mutex> lock(mtx_);
+            store_.insert(cmd.getKey(), cmd.getValue());
+            return "OK";
+        }
+        case CommandType::GET: {
+            std::string value;
+            std::lock_guard<std::mutex> lock(mtx_);
+            bool found = store_.search(cmd.getKey(), value);
+            if (found) {
+                return "VALUE:" + value;
+            } else {
+                return "NOT_FOUND";
+            }
+        }
+        case CommandType::DELETE: {
+            std::lock_guard<std::mutex> lock(mtx_);
+            bool removed = store_.remove(cmd.getKey());
+            return removed ? "OK" : "NOT_FOUND";
+        }
+        default:
+            throw std::invalid_argument("Unknown command type");
+    }
+}
+
 }  // namespace raft_kv

@@ -37,8 +37,9 @@ void assertEqual(const std::string& expected, const std::string& actual, const s
 // 全局变量用于测试回调
 std::vector<std::string> appliedCommands;
 
-void testCallback(const std::string& command) {
+std::string testCallback(const std::string& command) {
     appliedCommands.push_back(command);
+    return "OK";
 }
 
 /**

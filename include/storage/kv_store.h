@@ -94,6 +94,26 @@ public:
     void applyCommand(const std::string& command);
 
     /**
+     * @brief 应用命令到存储引擎并返回结果
+     * 
+     * 解析命令字符串并执行相应的 KV 操作，返回执行结果。
+     * 该方法用于 Raft 日志回放，将已提交的命令应用到状态机。
+     * 
+     * 命令格式：
+     * - PUT 命令: "PUT:key:value" -> 返回 "OK"
+     * - GET 命令: "GET:key" -> 返回 "VALUE:xxx" 或 "NOT_FOUND"
+     * - DELETE 命令: "DELETE:key" -> 返回 "OK" 或 "NOT_FOUND"
+     * 
+     * @param command 序列化的命令字符串
+     * @return 执行结果字符串
+     * 
+     * 线程安全：是
+     * 
+     * @throws std::invalid_argument 如果命令格式无效
+     */
+    std::string applyCommandWithResult(const std::string& command);
+
+    /**
      * @brief 获取存储的键值对数量
      * 
      * @return 当前存储的元素数量

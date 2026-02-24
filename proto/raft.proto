@@ -41,6 +41,28 @@ message AppendEntriesResponse {
     int32 conflict_term = 4;  // 冲突日志的任期号（用于快速回退优化）
 }
 
+// 客户端请求消息
+message ClientRequest {
+    enum OperationType {
+        PUT = 0;
+        GET = 1;
+        DELETE = 2;
+    }
+    
+    OperationType operation = 1;  // 操作类型
+    string key = 2;                // 键
+    string value = 3;              // 值（仅 PUT 操作使用）
+}
+
+// 客户端响应消息
+message ClientResponse {
+    bool success = 1;              // 操作是否成功
+    string value = 2;              // 返回值（仅 GET 操作使用）
+    string error = 3;              // 错误信息
+    bool is_leader = 4;            // 当前节点是否为 Leader
+    string leader_address = 5;     // Leader 地址（用于重定向）
+}
+
 // Raft RPC 服务定义
 service RaftService {
     // 请求投票 RPC
@@ -48,4 +70,10 @@ service RaftService {
     
     // 追加日志条目 RPC（也用作心跳）
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+// 客户端服务定义
+service ClientService {
+    // 处理客户端 KV 操作请求
+    rpc HandleRequest(ClientRequest) returns (ClientResponse);
 }

@@ -46,6 +46,10 @@ target_link_libraries(persister_test storage)
 add_executable(rpc_test rpc_test.cpp)
 target_link_libraries(rpc_test network raft storage)
 
+# KV 客户端测试
+add_executable(kv_client_test kv_client_test.cpp)
+target_link_libraries(kv_client_test client network raft storage)
+
 # 添加测试
 add_test(NAME SkipListNodeTest COMMAND skiplist_node_test)
 add_test(NAME SkipListTest COMMAND skiplist_test)
@@ -59,3 +63,4 @@ add_test(NAME LogReplicationTest COMMAND log_replication_test)
 add_test(NAME LogReplicationIntegrationTest COMMAND log_replication_integration_test)
 add_test(NAME PersisterTest COMMAND persister_test)
 add_test(NAME RPCTest COMMAND rpc_test)
+add_test(NAME KVClientTest COMMAND kv_client_test)

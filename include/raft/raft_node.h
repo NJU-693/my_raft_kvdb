@@ -4,12 +4,14 @@
 #include "log_entry.h"
 #include "rpc_messages.h"
 #include <vector>
+#include <map>
 #include <mutex>
 #include <chrono>
 #include <random>
 #include <atomic>
 #include <set>
 #include <functional>
+#include <condition_variable>
 
 namespace raft {
 
@@ -287,11 +289,52 @@ public:
 
     /**
      * @brief 设置状态机应用回调
-     * @param callback 状态机应用回调函数
+     * @param callback 状态机应用回调函数（参数：命令，返回：结果）
      * 
      * 当日志条目被应用到状态机时调用此回调。
+     * 回调函数应该返回执行结果（例如 GET 操作的值）。
      */
-    void setApplyCallback(std::function<void(const std::string&)> callback);
+    void setApplyCallback(std::function<std::string(const std::string&)> callback);
+
+    // ==================== 客户端请求接口 ====================
+
+    /**
+     * @brief 提交客户端命令
+     * @param command 命令字符串
+     * @param result 执行结果（输出参数）
+     * @param timeout_ms 超时时间（毫秒）
+     * @return 是否成功提交并执行命令
+     * 
+     * 只有 Leader 可以处理客户端请求。
+     * 如果当前节点不是 Leader，返回 false。
+     * 
+     * 需求: 2.3.2 (客户端-服务器通信)
+     */
+    bool submitCommand(const std::string& command, std::string& result, int timeout_ms = 5000);
+
+    /**
+     * @brief 获取节点地址
+     * @return 节点地址（格式: "host:port"）
+     */
+    std::string getNodeAddress() const;
+
+    /**
+     * @brief 设置节点地址
+     * @param address 节点地址
+     */
+    void setNodeAddress(const std::string& address);
+
+    /**
+     * @brief 获取 Leader 地址
+     * @return Leader 地址（如果已知），否则返回空字符串
+     */
+    std::string getLeaderAddress() const;
+
+    /**
+     * @brief 设置对等节点地址映射
+     * @param peer_addresses 节点 ID 到地址的映射
+     */
+    void setPeerAddresses(const std::map<int, std::string>& peer_addresses);
 
 private:
     // ==================== 持久化状态（所有服务器）====================
@@ -348,7 +391,26 @@ private:
 
     // ==================== 状态机应用回调 ====================
     
-    std::function<void(const std::string&)> applyCallback_;  // 状态机应用回调
+    std::function<std::string(const std::string&)> applyCallback_;  // 状态机应用回调
+
+    // ==================== 节点地址信息 ====================
+    
+    std::string nodeAddress_;                      // 当前节点地址
+    std::map<int, std::string> peerAddresses_;     // 对等节点地址映射
+
+    // ==================== 客户端请求相关 ====================
+    
+    struct PendingCommand {
+        int logIndex;                              // 日志索引
+        std::string command;                       // 命令内容
+        std::string result;                        // 执行结果
+        bool completed;                            // 是否完成
+        std::mutex mutex;                          // 互斥锁
+        std::condition_variable cv;                // 条件变量
+    };
+    
+    std::map<int, std::shared_ptr<PendingCommand>> pendingCommands_;  // 待处理的命令
+    std::mutex pendingCommandsMutex_;              // 保护 pendingCommands_
 
     // ==================== 私有辅助方法 ====================
 
