@@ -16,6 +16,7 @@
 - ✅ **跳表存储引擎**：高效的 O(log n) 查找、插入和删除操作
 - ✅ **分布式一致性**：保证多节点数据一致性
 - ✅ **持久化存储**：支持节点重启后数据恢复
+- ✅ **RPC 通信框架**：轻量级的节点间通信机制
 - ✅ **客户端接口**：提供简单的 Put/Get/Delete 操作
 
 ## 项目结构
@@ -67,11 +68,14 @@ ctest
 ### 运行示例
 
 ```bash
-# 单节点模式
-./bin/single_node
+# RPC 框架演示
+./bin/rpc_demo
 
-# 集群模式（需要先配置 config/cluster.conf）
-./bin/cluster --config ../config/cluster.conf --node-id 1
+# nextIndex 更新机制演示
+./bin/nextindex_update_demo
+
+# 日志冲突解决演示
+./bin/conflict_resolution_demo
 ```
 
 ## 使用示例
@@ -99,6 +103,7 @@ store.remove("key1");
 - [架构设计](docs/architecture.md)
 - [Raft 算法详解](docs/raft-algorithm.md)
 - [跳表实现说明](docs/skiplist.md)
+- [RPC 框架使用指南](docs/rpc-framework.md)
 
 ## 开发进度
 
@@ -106,9 +111,10 @@ store.remove("key1");
 - [x] 跳表数据结构实现
 - [x] KV 存储引擎实现
 - [x] Raft 核心算法实现
-- [ ] 持久化实现
-- [ ] 网络通信实现
+- [x] 持久化实现
+- [x] RPC 通信框架实现
 - [ ] 集成测试
+- [ ] 客户端接口实现
 
 详细任务列表请查看 `.kiro/specs/raft-kv-store/tasks.md`
 

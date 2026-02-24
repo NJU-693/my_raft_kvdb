@@ -14,3 +14,7 @@ target_link_libraries(nextindex_update_demo raft storage util)
 # 日志冲突解决演示
 add_executable(conflict_resolution_demo conflict_resolution_demo.cpp)
 target_link_libraries(conflict_resolution_demo raft storage util)
+
+# RPC 框架演示
+add_executable(rpc_demo rpc_demo.cpp)
+target_link_libraries(rpc_demo network raft storage)
