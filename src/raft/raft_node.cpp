@@ -12,6 +12,7 @@ RaftNode::RaftNode(int nodeId, const std::vector<int>& peerIds)
       peerIds_(peerIds),
       state_(NodeState::FOLLOWER),
       leaderId_(-1),
+      currentElectionTerm_(-1),
       lastHeartbeatTime_(std::chrono::steady_clock::now()),
       lastHeartbeatSent_(std::chrono::steady_clock::now()),
       heartbeatInterval_(HEARTBEAT_INTERVAL),
@@ -74,6 +75,8 @@ void RaftNode::handleRequestVote(const RequestVoteArgs& args, RequestVoteReply& 
         votedFor_ = -1;
         state_ = NodeState::FOLLOWER;
         leaderId_ = -1;
+        votesReceived_.clear();
+        currentElectionTerm_ = -1;
         reply.term = currentTerm_;
     }
     
@@ -110,6 +113,8 @@ void RaftNode::handleAppendEntries(const AppendEntriesArgs& args, AppendEntriesR
         if (state_ != NodeState::FOLLOWER) {
             state_ = NodeState::FOLLOWER;
             votedFor_ = -1;
+            votesReceived_.clear();
+            currentElectionTerm_ = -1;
         }
         leaderId_ = args.leaderId;
         resetElectionTimer();  // 重置选举超时
@@ -149,18 +154,25 @@ void RaftNode::handleAppendEntries(const AppendEntriesArgs& args, AppendEntriesR
             if (log_[currentIndex].term != args.entries[i].term) {
                 // 删除冲突的条目及其后的所有条目
                 log_.erase(log_.begin() + currentIndex, log_.end());
-                log_.push_back(args.entries[i]);
+                // 追加新条目
+                LogEntry newEntry = args.entries[i];
+                newEntry.index = currentIndex;  // 确保索引正确
+                log_.push_back(newEntry);
             }
             // 如果不冲突，跳过（已存在相同的条目）
         } else {
             // 追加新条目
-            log_.push_back(args.entries[i]);
+            LogEntry newEntry = args.entries[i];
+            newEntry.index = currentIndex;  // 确保索引正确
+            log_.push_back(newEntry);
         }
     }
     
     // 规则 5: 更新 commitIndex
     if (args.leaderCommit > commitIndex_) {
         commitIndex_ = std::min(args.leaderCommit, getLastLogIndex());
+        // 应用新提交的日志条目
+        applyCommittedEntriesInternal();
     }
     
     reply.success = true;
@@ -177,6 +189,11 @@ void RaftNode::startElection() {
     votedFor_ = nodeId_;  // 投票给自己
     leaderId_ = -1;
     
+    // 初始化选举状态
+    currentElectionTerm_ = currentTerm_;
+    votesReceived_.clear();
+    votesReceived_.insert(nodeId_);  // 自己的票
+    
     // 重置选举超时
     resetElectionTimer();
     
@@ -184,12 +201,64 @@ void RaftNode::startElection() {
     // 这里只处理状态转换逻辑
 }
 
+bool RaftNode::handleVoteResponse(int nodeId, const RequestVoteReply& reply) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 只有 Candidate 才处理投票响应
+    if (state_ != NodeState::CANDIDATE) {
+        return false;
+    }
+    
+    // 检查任期是否匹配当前选举
+    if (reply.term > currentTerm_) {
+        // 发现更高任期，转为 Follower
+        currentTerm_ = reply.term;
+        votedFor_ = -1;
+        state_ = NodeState::FOLLOWER;
+        leaderId_ = -1;
+        votesReceived_.clear();
+        resetElectionTimer();
+        return false;
+    }
+    
+    // 忽略过期的投票响应
+    if (reply.term < currentElectionTerm_) {
+        return false;
+    }
+    
+    // 处理投票结果
+    if (reply.voteGranted) {
+        votesReceived_.insert(nodeId);
+        
+        // 检查是否获得多数票
+        int totalNodes = peerIds_.size() + 1;  // 包括自己
+        int majority = totalNodes / 2 + 1;
+        
+        if (static_cast<int>(votesReceived_.size()) >= majority) {
+            // 获得多数票，成为 Leader
+            becomeLeaderInternal();
+            return true;
+        }
+    }
+    
+    return false;
+}
+
 void RaftNode::becomeLeader() {
     std::lock_guard<std::mutex> lock(mutex_);
+    becomeLeaderInternal();
+}
+
+void RaftNode::becomeLeaderInternal() {
+    // 注意：此方法假设调用者已持有锁
     
     // 转变为 Leader
     state_ = NodeState::LEADER;
     leaderId_ = nodeId_;
+    
+    // 清理选举状态
+    votesReceived_.clear();
+    currentElectionTerm_ = -1;
     
     // 初始化 nextIndex 和 matchIndex
     int lastLogIndex = getLastLogIndex();
@@ -216,6 +285,10 @@ void RaftNode::becomeFollower(int term) {
     // 转变为 Follower
     state_ = NodeState::FOLLOWER;
     leaderId_ = -1;
+    
+    // 清理选举状态
+    votesReceived_.clear();
+    currentElectionTerm_ = -1;
     
     // 重置选举超时
     resetElectionTimer();
@@ -304,6 +377,215 @@ int RaftNode::getLastLogTerm() const {
 int RaftNode::getLogSize() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return log_.size() - 1;  // 减去哨兵节点
+}
+
+int RaftNode::getVoteCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(votesReceived_.size());
+}
+
+int RaftNode::getMajorityThreshold() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int totalNodes = peerIds_.size() + 1;  // 包括自己
+    return totalNodes / 2 + 1;
+}
+
+// ==================== 日志复制接口 ====================
+
+void RaftNode::replicateLog() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 只有 Leader 可以复制日志
+    if (state_ != NodeState::LEADER) {
+        return;
+    }
+    
+    // 注意：实际的 RPC 发送需要在外部实现（涉及网络通信）
+    // 这里只准备 AppendEntries 参数，外部代码需要调用 createAppendEntriesArgs
+    // 并发送 RPC 请求，然后调用 handleAppendEntriesResponse 处理响应
+}
+
+bool RaftNode::handleAppendEntriesResponse(int nodeId, const AppendEntriesReply& reply) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 只有 Leader 处理 AppendEntries 响应
+    if (state_ != NodeState::LEADER) {
+        return false;
+    }
+    
+    // 找到节点在 peerIds_ 中的索引
+    int nodeIndex = -1;
+    for (size_t i = 0; i < peerIds_.size(); ++i) {
+        if (peerIds_[i] == nodeId) {
+            nodeIndex = i;
+            break;
+        }
+    }
+    
+    if (nodeIndex == -1) {
+        return false;  // 未知节点
+    }
+    
+    // 检查任期
+    if (reply.term > currentTerm_) {
+        // 发现更高任期，转为 Follower
+        currentTerm_ = reply.term;
+        votedFor_ = -1;
+        state_ = NodeState::FOLLOWER;
+        leaderId_ = -1;
+        votesReceived_.clear();
+        resetElectionTimer();
+        return false;
+    }
+    
+    if (reply.success) {
+        // 成功复制日志
+        // 更新 nextIndex 和 matchIndex
+        int lastLogIndex = getLastLogIndex();
+        nextIndex_[nodeIndex] = lastLogIndex + 1;
+        matchIndex_[nodeIndex] = lastLogIndex;
+        
+        // 检查是否可以更新 commitIndex
+        updateCommitIndex();
+        return true;
+    } else {
+        // 日志复制失败，需要回退 nextIndex
+        if (reply.conflictTerm == -1) {
+            // Follower 的日志太短
+            nextIndex_[nodeIndex] = reply.conflictIndex;
+        } else {
+            // 存在冲突的任期
+            // 查找 Leader 日志中该任期的最后一个条目
+            int conflictTermLastIndex = -1;
+            for (int i = getLastLogIndex(); i >= 1; --i) {
+                if (log_[i].term == reply.conflictTerm) {
+                    conflictTermLastIndex = i;
+                    break;
+                }
+            }
+            
+            if (conflictTermLastIndex != -1) {
+                // Leader 也有该任期的日志，从该任期的最后一个条目之后开始
+                nextIndex_[nodeIndex] = conflictTermLastIndex + 1;
+            } else {
+                // Leader 没有该任期的日志，从冲突索引开始
+                nextIndex_[nodeIndex] = reply.conflictIndex;
+            }
+        }
+        
+        // 确保 nextIndex 不小于 1
+        if (nextIndex_[nodeIndex] < 1) {
+            nextIndex_[nodeIndex] = 1;
+        }
+        
+        return false;
+    }
+}
+
+void RaftNode::applyCommittedEntries() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applyCommittedEntriesInternal();
+}
+
+void RaftNode::applyCommittedEntriesInternal() {
+    // 注意：此方法假设调用者已持有锁
+    
+    // 应用 lastApplied + 1 到 commitIndex 之间的所有日志条目
+    while (lastApplied_ < commitIndex_) {
+        lastApplied_++;
+        
+        if (lastApplied_ < static_cast<int>(log_.size())) {
+            const LogEntry& entry = log_[lastApplied_];
+            
+            // 调用状态机应用回调
+            if (applyCallback_) {
+                applyCallback_(entry.command);
+            }
+        }
+    }
+}
+
+void RaftNode::updateCommitIndex() {
+    // 注意：此方法假设调用者已持有锁
+    
+    // 只有 Leader 可以更新 commitIndex
+    if (state_ != NodeState::LEADER) {
+        return;
+    }
+    
+    // 找到可以提交的最高日志索引
+    // 需要多数节点都已复制的日志条目
+    int lastLogIndex = getLastLogIndex();
+    int totalNodes = peerIds_.size() + 1;  // 包括自己
+    int majority = totalNodes / 2 + 1;
+    
+    for (int index = lastLogIndex; index > commitIndex_; --index) {
+        // 检查当前任期的日志条目（安全性要求）
+        if (log_[index].term != currentTerm_) {
+            continue;
+        }
+        
+        // 统计已复制该索引的节点数量（包括 Leader 自己）
+        int replicatedCount = 1;  // Leader 自己已经有这个日志
+        for (size_t i = 0; i < matchIndex_.size(); ++i) {
+            if (matchIndex_[i] >= index) {
+                replicatedCount++;
+            }
+        }
+        
+        // 如果多数节点已复制，则可以提交
+        if (replicatedCount >= majority) {
+            commitIndex_ = index;
+            break;
+        }
+    }
+}
+
+AppendEntriesArgs RaftNode::createAppendEntriesArgs(int nodeIndex) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // 只有 Leader 可以创建 AppendEntries 参数
+    if (state_ != NodeState::LEADER || nodeIndex < 0 || 
+        nodeIndex >= static_cast<int>(peerIds_.size())) {
+        return AppendEntriesArgs();
+    }
+    
+    AppendEntriesArgs args;
+    args.term = currentTerm_;
+    args.leaderId = nodeId_;
+    args.leaderCommit = commitIndex_;
+    
+    // 确定要发送的日志条目
+    int nextIndex = nextIndex_[nodeIndex];
+    args.prevLogIndex = nextIndex - 1;
+    
+    if (args.prevLogIndex > 0 && args.prevLogIndex < static_cast<int>(log_.size())) {
+        args.prevLogTerm = log_[args.prevLogIndex].term;
+    } else {
+        args.prevLogTerm = 0;
+    }
+    
+    // 添加从 nextIndex 开始的所有日志条目
+    for (int i = nextIndex; i < static_cast<int>(log_.size()); ++i) {
+        args.entries.push_back(log_[i]);
+    }
+    
+    return args;
+}
+
+int RaftNode::getCommitIndex() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return commitIndex_;
+}
+
+int RaftNode::getLastApplied() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lastApplied_;
+}
+
+void RaftNode::setApplyCallback(std::function<void(const std::string&)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applyCallback_ = callback;
 }
 
 // ==================== 私有辅助方法 ====================

@@ -290,6 +290,157 @@ void testConcurrentAccess() {
               << " log entries concurrently" << std::endl;
 }
 
+void testLeaderElectionLogic() {
+    std::cout << "\n=== Test: Leader Election Logic ===" << std::endl;
+    
+    std::vector<int> peers = {2, 3, 4, 5};  // 5 node cluster
+    RaftNode node(1, peers);
+    
+    // Test initial vote count
+    assertTrue(node.getVoteCount() == 0, 
+               "Initial vote count should be 0");
+    assertTrue(node.getMajorityThreshold() == 3, 
+               "Majority threshold for 5 nodes should be 3");
+    
+    // Start election
+    node.startElection();
+    assertTrue(node.getState() == NodeState::CANDIDATE, 
+               "Node should be CANDIDATE after startElection");
+    assertTrue(node.getVoteCount() == 1, 
+               "Vote count should be 1 (self vote) after startElection");
+    
+    // Simulate receiving votes
+    RequestVoteReply reply1(1, true);   // Vote granted
+    RequestVoteReply reply2(1, false);  // Vote denied
+    RequestVoteReply reply3(1, true);   // Vote granted
+    
+    // Handle first vote (not enough for majority)
+    bool becameLeader = node.handleVoteResponse(2, reply1);
+    assertTrue(!becameLeader, 
+               "Should not become leader with 2 votes out of 5");
+    assertTrue(node.getVoteCount() == 2, 
+               "Vote count should be 2 after first granted vote");
+    assertTrue(node.getState() == NodeState::CANDIDATE, 
+               "Should remain CANDIDATE");
+    
+    // Handle denied vote
+    becameLeader = node.handleVoteResponse(3, reply2);
+    assertTrue(!becameLeader, 
+               "Should not become leader after denied vote");
+    assertTrue(node.getVoteCount() == 2, 
+               "Vote count should remain 2 after denied vote");
+    
+    // Handle third vote (should reach majority)
+    becameLeader = node.handleVoteResponse(4, reply3);
+    assertTrue(becameLeader, 
+               "Should become leader with 3 votes out of 5");
+    assertTrue(node.getState() == NodeState::LEADER, 
+               "Should be LEADER after reaching majority");
+    assertTrue(node.isLeader(), 
+               "isLeader() should return true");
+    assertTrue(node.getVoteCount() == 0, 
+               "Vote count should be cleared after becoming leader");
+}
+
+void testSplitVoteScenario() {
+    std::cout << "\n=== Test: Split Vote Scenario ===" << std::endl;
+    
+    std::vector<int> peers = {2, 3};  // 3 node cluster
+    RaftNode node(1, peers);
+    
+    assertTrue(node.getMajorityThreshold() == 2, 
+               "Majority threshold for 3 nodes should be 2");
+    
+    // Start election
+    node.startElection();
+    int initialTerm = node.getCurrentTerm();
+    
+    // Simulate split vote (only get 1 vote, need 2 for majority)
+    RequestVoteReply reply1(initialTerm, false);  // Vote denied
+    RequestVoteReply reply2(initialTerm, false);  // Vote denied
+    
+    bool becameLeader1 = node.handleVoteResponse(2, reply1);
+    bool becameLeader2 = node.handleVoteResponse(3, reply2);
+    
+    assertTrue(!becameLeader1 && !becameLeader2, 
+               "Should not become leader in split vote");
+    assertTrue(node.getState() == NodeState::CANDIDATE, 
+               "Should remain CANDIDATE after split vote");
+    assertTrue(node.getVoteCount() == 1, 
+               "Should only have self vote after split vote");
+    
+    // Simulate election timeout and restart
+    node.startElection();
+    assertTrue(node.getCurrentTerm() == initialTerm + 1, 
+               "Term should increment on new election");
+    assertTrue(node.getVoteCount() == 1, 
+               "Should reset to self vote on new election");
+}
+
+void testHigherTermResponse() {
+    std::cout << "\n=== Test: Higher Term Response ===" << std::endl;
+    
+    std::vector<int> peers = {2, 3};
+    RaftNode node(1, peers);
+    
+    // Start election (term becomes 1)
+    node.startElection();
+    assertTrue(node.getCurrentTerm() == 1, 
+               "Term should be 1 after startElection");
+    assertTrue(node.getState() == NodeState::CANDIDATE, 
+               "Should be CANDIDATE");
+    
+    // Receive vote response with higher term
+    RequestVoteReply reply(2, false);  // Higher term, vote denied
+    bool becameLeader = node.handleVoteResponse(2, reply);
+    
+    assertTrue(!becameLeader, 
+               "Should not become leader when seeing higher term");
+    assertTrue(node.getCurrentTerm() == 2, 
+               "Should update to higher term");
+    assertTrue(node.getState() == NodeState::FOLLOWER, 
+               "Should become FOLLOWER when seeing higher term");
+    assertTrue(node.getVoteCount() == 0, 
+               "Vote count should be cleared when becoming follower");
+}
+
+void testOutdatedVoteResponse() {
+    std::cout << "\n=== Test: Outdated Vote Response ===" << std::endl;
+    
+    std::vector<int> peers = {2, 3};
+    RaftNode node(1, peers);
+    
+    // Start first election (term becomes 1)
+    node.startElection();
+    int firstTerm = node.getCurrentTerm();
+    
+    // Start second election (term becomes 2)
+    node.startElection();
+    int secondTerm = node.getCurrentTerm();
+    assertTrue(secondTerm == firstTerm + 1, 
+               "Second election should increment term");
+    
+    // Receive outdated vote response from first election
+    RequestVoteReply outdatedReply(firstTerm, true);
+    bool becameLeader = node.handleVoteResponse(2, outdatedReply);
+    
+    assertTrue(!becameLeader, 
+               "Should ignore outdated vote response");
+    assertTrue(node.getVoteCount() == 1, 
+               "Vote count should not change for outdated response");
+    assertTrue(node.getState() == NodeState::CANDIDATE, 
+               "Should remain CANDIDATE");
+    
+    // Receive current vote response
+    RequestVoteReply currentReply(secondTerm, true);
+    becameLeader = node.handleVoteResponse(3, currentReply);
+    
+    assertTrue(becameLeader, 
+               "Should become leader with current vote response");
+    assertTrue(node.getState() == NodeState::LEADER, 
+               "Should be LEADER");
+}
+
 int main() {
     std::cout << "Running RaftNode Tests..." << std::endl;
     
@@ -302,6 +453,10 @@ int main() {
         testElectionTimeout();
         testHeartbeatTimer();
         testConcurrentAccess();
+        testLeaderElectionLogic();
+        testSplitVoteScenario();
+        testHigherTermResponse();
+        testOutdatedVoteResponse();
         
         std::cout << "\n=== All Tests Passed! ===" << std::endl;
         return 0;

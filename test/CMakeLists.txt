@@ -26,6 +26,18 @@ add_executable(rpc_messages_test rpc_messages_test.cpp)
 add_executable(raft_node_test raft_node_test.cpp)
 target_link_libraries(raft_node_test raft storage)
 
+# 领导者选举集成测试
+add_executable(leader_election_integration_test leader_election_integration_test.cpp)
+target_link_libraries(leader_election_integration_test raft storage)
+
+# 日志复制测试
+add_executable(log_replication_test log_replication_test.cpp)
+target_link_libraries(log_replication_test raft storage)
+
+# 日志复制集成测试
+add_executable(log_replication_integration_test log_replication_integration_test.cpp)
+target_link_libraries(log_replication_integration_test raft storage)
+
 # 添加测试
 add_test(NAME SkipListNodeTest COMMAND skiplist_node_test)
 add_test(NAME SkipListTest COMMAND skiplist_test)
@@ -34,3 +46,6 @@ add_test(NAME KVStoreTest COMMAND kv_store_test)
 add_test(NAME LogEntryTest COMMAND log_entry_test)
 add_test(NAME RPCMessagesTest COMMAND rpc_messages_test)
 add_test(NAME RaftNodeTest COMMAND raft_node_test)
+add_test(NAME LeaderElectionIntegrationTest COMMAND leader_election_integration_test)
+add_test(NAME LogReplicationTest COMMAND log_replication_test)
+add_test(NAME LogReplicationIntegrationTest COMMAND log_replication_integration_test)
