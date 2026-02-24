@@ -2,6 +2,7 @@
 set(STORAGE_SOURCES
     command.cpp
     kv_store.cpp
+    persister.cpp
 )
 
 add_library(storage ${STORAGE_SOURCES})

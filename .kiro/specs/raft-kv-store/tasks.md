@@ -118,13 +118,13 @@
   - _需求: 2.1.2_
 
 ### 7. 持久化实现
-- [ ] 7.1 实现 Persister 类
+- [x] 7.1 实现 Persister 类
   - 创建 include/storage/persister.h 和 src/storage/persister.cpp
   - 实现 Raft 状态的保存和加载
   - 实现原子性写入和数据完整性保证
   - _需求: 2.1.3_
 
-- [ ]* 7.2 编写持久化测试
+- [x]* 7.2 编写持久化测试
   - 测试崩溃恢复场景
   - _需求: 2.1.3_
 

@@ -38,6 +38,10 @@ target_link_libraries(log_replication_test raft storage)
 add_executable(log_replication_integration_test log_replication_integration_test.cpp)
 target_link_libraries(log_replication_integration_test raft storage)
 
+# 持久化测试
+add_executable(persister_test persister_test.cpp)
+target_link_libraries(persister_test storage)
+
 # 添加测试
 add_test(NAME SkipListNodeTest COMMAND skiplist_node_test)
 add_test(NAME SkipListTest COMMAND skiplist_test)
@@ -49,3 +53,4 @@ add_test(NAME RaftNodeTest COMMAND raft_node_test)
 add_test(NAME LeaderElectionIntegrationTest COMMAND leader_election_integration_test)
 add_test(NAME LogReplicationTest COMMAND log_replication_test)
 add_test(NAME LogReplicationIntegrationTest COMMAND log_replication_integration_test)
+add_test(NAME PersisterTest COMMAND persister_test)
