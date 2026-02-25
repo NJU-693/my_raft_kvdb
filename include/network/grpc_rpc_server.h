@@ -11,7 +11,8 @@
 namespace network {
 
 /**
- * @brief gRPC RaftService 实现
+ * @brief gRPC RaftService 实现（针对于系统内部节点间通信的服务）
+ * raft节点间的通信（服务端角色）
  */
 class RaftServiceImpl final : public raft::RaftService::Service {
 public:
@@ -32,7 +33,8 @@ private:
 };
 
 /**
- * @brief gRPC ClientService 实现
+ * @brief gRPC ClientService 实现（针对于整个系统对外客户端的服务）
+ * 处理 外部 客户端的KV操作请求（服务端角色）
  */
 class ClientServiceImpl final : public raft::ClientService::Service {
 public:

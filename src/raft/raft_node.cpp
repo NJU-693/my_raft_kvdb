@@ -532,6 +532,9 @@ void RaftNode::updateCommitIndex() {
         return;
     }
     
+    // 保存旧的 commitIndex 以便检测是否有更新
+    int oldCommitIndex = commitIndex_;
+    
     // 找到可以提交的最高日志索引
     // 需要多数节点都已复制的日志条目
     int lastLogIndex = getLastLogIndex();
@@ -557,6 +560,11 @@ void RaftNode::updateCommitIndex() {
             commitIndex_ = index;
             break;
         }
+    }
+    
+    // 如果 commitIndex 有更新，立即应用
+    if (commitIndex_ > oldCommitIndex) {
+        applyCommittedEntriesInternal();
     }
 }
 
