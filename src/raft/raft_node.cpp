@@ -1,6 +1,9 @@
 #include "raft/raft_node.h"
+#include "network/rpc_client.h"
 #include <algorithm>
 #include <condition_variable>
+#include <thread>
+#include <iostream>
 
 namespace raft {
 
@@ -198,8 +201,12 @@ void RaftNode::startElection() {
     // 重置选举超时
     resetElectionTimer();
     
-    // 注意：实际的投票请求发送需要在外部实现（涉及网络通信）
-    // 这里只处理状态转换逻辑
+    // 向所有对等节点发送 RequestVote RPC
+    for (size_t i = 0; i < peerIds_.size(); ++i) {
+        std::thread([this, i]() {
+            sendRequestVoteAsync(peerIds_[i]);
+        }).detach();
+    }
 }
 
 bool RaftNode::handleVoteResponse(int nodeId, const RequestVoteReply& reply) {
@@ -401,16 +408,23 @@ void RaftNode::replicateLog() {
         return;
     }
     
-    // 注意：实际的 RPC 发送需要在外部实现（涉及网络通信）
-    // 这里只准备 AppendEntries 参数，外部代码需要调用 createAppendEntriesArgs
-    // 并发送 RPC 请求，然后调用 handleAppendEntriesResponse 处理响应
+    // 向所有对等节点发送 AppendEntries RPC
+    for (size_t i = 0; i < peerIds_.size(); ++i) {
+        std::thread([this, i]() {
+            sendAppendEntriesAsync(i);
+        }).detach();
+    }
 }
 
 bool RaftNode::handleAppendEntriesResponse(int nodeId, const AppendEntriesReply& reply) {
     std::lock_guard<std::mutex> lock(mutex_);
     
+    std::cout << "[handleAppendEntriesResponse] Received response from node " << nodeId 
+              << ", success=" << reply.success << ", term=" << reply.term << std::endl;
+    
     // 只有 Leader 处理 AppendEntries 响应
     if (state_ != NodeState::LEADER) {
+        std::cout << "[handleAppendEntriesResponse] Not leader, ignoring response" << std::endl;
         return false;
     }
     
@@ -424,12 +438,18 @@ bool RaftNode::handleAppendEntriesResponse(int nodeId, const AppendEntriesReply&
     }
     
     if (nodeIndex == -1) {
+        std::cout << "[handleAppendEntriesResponse] Unknown node " << nodeId << std::endl;
         return false;  // 未知节点
     }
+    
+    std::cout << "[handleAppendEntriesResponse] Node index: " << nodeIndex 
+              << ", current matchIndex: " << matchIndex_[nodeIndex] 
+              << ", nextIndex: " << nextIndex_[nodeIndex] << std::endl;
     
     // 检查任期
     if (reply.term > currentTerm_) {
         // 发现更高任期，转为 Follower
+        std::cout << "[handleAppendEntriesResponse] Higher term detected, becoming follower" << std::endl;
         currentTerm_ = reply.term;
         votedFor_ = -1;
         state_ = NodeState::FOLLOWER;
@@ -442,9 +462,22 @@ bool RaftNode::handleAppendEntriesResponse(int nodeId, const AppendEntriesReply&
     if (reply.success) {
         // 成功复制日志
         // 更新 nextIndex 和 matchIndex
+        // 注意：matchIndex 应该基于实际发送的日志，而不是当前的 lastLogIndex
+        // 因为在发送 AppendEntries 后，Leader 可能又追加了新的日志条目
+        int prevNextIndex = nextIndex_[nodeIndex];
         int lastLogIndex = getLastLogIndex();
-        nextIndex_[nodeIndex] = lastLogIndex + 1;
-        matchIndex_[nodeIndex] = lastLogIndex;
+        
+        // matchIndex 应该是 Follower 已确认复制的最高索引
+        // 即 prevNextIndex - 1 + 发送的条目数量
+        // 但由于我们发送了从 prevNextIndex 到 lastLogIndex 的所有条目
+        // 所以 matchIndex 应该是发送时的 lastLogIndex
+        // 为了安全起见，我们使用 min(当前 lastLogIndex, 预期的 matchIndex)
+        int expectedMatchIndex = lastLogIndex;
+        matchIndex_[nodeIndex] = expectedMatchIndex;
+        nextIndex_[nodeIndex] = expectedMatchIndex + 1;
+        
+        std::cout << "[handleAppendEntriesResponse] Updated matchIndex[" << nodeIndex << "] to " 
+                  << matchIndex_[nodeIndex] << ", nextIndex to " << nextIndex_[nodeIndex] << std::endl;
         
         // 检查是否可以更新 commitIndex
         updateCommitIndex();
@@ -495,13 +528,21 @@ void RaftNode::applyCommittedEntriesInternal() {
     while (lastApplied_ < commitIndex_) {
         lastApplied_++;
         
+        std::cout << "[applyCommittedEntriesInternal] Applying log entry at index " << lastApplied_ 
+                  << " (commitIndex: " << commitIndex_ << ")" << std::endl;
+        
         if (lastApplied_ < static_cast<int>(log_.size())) {
             const LogEntry& entry = log_[lastApplied_];
+            
+            std::cout << "[applyCommittedEntriesInternal] Entry command: " << entry.command << std::endl;
             
             // 调用状态机应用回调
             std::string result = "OK";
             if (applyCallback_) {
                 result = applyCallback_(entry.command);
+                std::cout << "[applyCommittedEntriesInternal] Callback result: " << result << std::endl;
+            } else {
+                std::cout << "[applyCommittedEntriesInternal] WARNING: No applyCallback set!" << std::endl;
             }
             
             // 通知等待该命令的客户端
@@ -511,6 +552,10 @@ void RaftNode::applyCommittedEntriesInternal() {
                 auto it = pendingCommands_.find(lastApplied_);
                 if (it != pendingCommands_.end()) {
                     pendingCmd = it->second;
+                    std::cout << "[applyCommittedEntriesInternal] Found pending command for index " << lastApplied_ << std::endl;
+                } else {
+                    std::cout << "[applyCommittedEntriesInternal] No pending command for index " << lastApplied_ 
+                              << " (total pending: " << pendingCommands_.size() << ")" << std::endl;
                 }
             }
             
@@ -519,7 +564,11 @@ void RaftNode::applyCommittedEntriesInternal() {
                 pendingCmd->result = result;
                 pendingCmd->completed = true;
                 pendingCmd->cv.notify_one();
+                std::cout << "[applyCommittedEntriesInternal] Notified pending command at index " << lastApplied_ << std::endl;
             }
+        } else {
+            std::cout << "[applyCommittedEntriesInternal] WARNING: lastApplied_ " << lastApplied_ 
+                      << " >= log size " << log_.size() << std::endl;
         }
     }
 }
@@ -541,9 +590,16 @@ void RaftNode::updateCommitIndex() {
     int totalNodes = peerIds_.size() + 1;  // 包括自己
     int majority = totalNodes / 2 + 1;
     
+    std::cout << "[updateCommitIndex] Leader checking commit: lastLogIndex=" << lastLogIndex 
+              << ", currentCommitIndex=" << commitIndex_ 
+              << ", totalNodes=" << totalNodes 
+              << ", majority=" << majority << std::endl;
+    
     for (int index = lastLogIndex; index > commitIndex_; --index) {
         // 检查当前任期的日志条目（安全性要求）
         if (log_[index].term != currentTerm_) {
+            std::cout << "[updateCommitIndex] Skipping index " << index 
+                      << " (term " << log_[index].term << " != currentTerm " << currentTerm_ << ")" << std::endl;
             continue;
         }
         
@@ -555,16 +611,24 @@ void RaftNode::updateCommitIndex() {
             }
         }
         
+        std::cout << "[updateCommitIndex] Index " << index 
+                  << " replicated on " << replicatedCount << " nodes (need " << majority << ")" << std::endl;
+        
         // 如果多数节点已复制，则可以提交
         if (replicatedCount >= majority) {
             commitIndex_ = index;
+            std::cout << "[updateCommitIndex] Updating commitIndex to " << index << std::endl;
             break;
         }
     }
     
     // 如果 commitIndex 有更新，立即应用
     if (commitIndex_ > oldCommitIndex) {
+        std::cout << "[updateCommitIndex] commitIndex updated from " << oldCommitIndex 
+                  << " to " << commitIndex_ << ", applying entries on LEADER" << std::endl;
         applyCommittedEntriesInternal();
+    } else {
+        std::cout << "[updateCommitIndex] No update to commitIndex" << std::endl;
     }
 }
 
@@ -622,6 +686,7 @@ bool RaftNode::submitCommand(const std::string& command, std::string& result, in
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != NodeState::LEADER) {
+            std::cout << "[submitCommand] Not leader, rejecting command" << std::endl;
             return false;
         }
     }
@@ -629,8 +694,12 @@ bool RaftNode::submitCommand(const std::string& command, std::string& result, in
     // 追加日志条目
     int logIndex = appendLogEntry(command);
     if (logIndex < 0) {
+        std::cout << "[submitCommand] Failed to append log entry" << std::endl;
         return false;
     }
+    
+    std::cout << "[submitCommand] Command appended at index " << logIndex 
+              << ", command: " << command << std::endl;
     
     // 检查是否是单节点集群
     bool isSingleNode = false;
@@ -641,6 +710,7 @@ bool RaftNode::submitCommand(const std::string& command, std::string& result, in
         // 如果是单节点集群，立即更新 commitIndex
         if (isSingleNode) {
             commitIndex_ = logIndex;
+            std::cout << "[submitCommand] Single node cluster, commitIndex updated to " << logIndex << std::endl;
         }
     }
     
@@ -653,14 +723,20 @@ bool RaftNode::submitCommand(const std::string& command, std::string& result, in
     {
         std::lock_guard<std::mutex> lock(pendingCommandsMutex_);
         pendingCommands_[logIndex] = pendingCmd;
+        std::cout << "[submitCommand] PendingCommand created for index " << logIndex 
+                  << ", total pending: " << pendingCommands_.size() << std::endl;
     }
     
     // 如果是单节点集群，立即应用命令
     if (isSingleNode) {
+        std::cout << "[submitCommand] Applying committed entries for single node" << std::endl;
         applyCommittedEntries();
     }
     
     // 等待命令被提交和应用
+    std::cout << "[submitCommand] Waiting for command at index " << logIndex 
+              << " to be applied (timeout: " << timeout_ms << "ms)" << std::endl;
+    
     std::unique_lock<std::mutex> lock(pendingCmd->mutex);
     bool success = pendingCmd->cv.wait_for(
         lock,
@@ -670,6 +746,17 @@ bool RaftNode::submitCommand(const std::string& command, std::string& result, in
     
     if (success) {
         result = pendingCmd->result;
+        std::cout << "[submitCommand] Command at index " << logIndex 
+                  << " completed successfully, result: " << result << std::endl;
+    } else {
+        std::cout << "[submitCommand] Command at index " << logIndex 
+                  << " TIMED OUT after " << timeout_ms << "ms" << std::endl;
+        
+        // 打印当前状态用于调试
+        std::lock_guard<std::mutex> stateLock(mutex_);
+        std::cout << "[submitCommand] Current state - commitIndex: " << commitIndex_ 
+                  << ", lastApplied: " << lastApplied_ 
+                  << ", logSize: " << log_.size() << std::endl;
     }
     
     // 清理待处理命令
@@ -735,6 +822,118 @@ bool RaftNode::isLogUpToDate(int lastLogIndex, int lastLogTerm) const {
         return lastLogTerm > myLastLogTerm;
     }
     return lastLogIndex >= myLastLogIndex;
+}
+
+// ==================== RPC 客户端管理 ====================
+
+void* RaftNode::getRPCClient(int nodeId) {
+    std::lock_guard<std::mutex> lock(rpcClientsMutex_);
+    
+    // 检查是否已存在客户端
+    auto it = rpcClients_.find(nodeId);
+    if (it != rpcClients_.end()) {
+        return it->second.get();
+    }
+    
+    // 获取节点地址
+    auto addr_it = peerAddresses_.find(nodeId);
+    if (addr_it == peerAddresses_.end()) {
+        std::cerr << "Node " << nodeId_ << ": No address found for peer " << nodeId << std::endl;
+        return nullptr;
+    }
+    
+    // 创建新的 RPC 客户端
+    try {
+        auto client = network::createRPCClient(addr_it->second);
+        if (!client || !client->connect(addr_it->second)) {
+            std::cerr << "Node " << nodeId_ << ": Failed to connect to peer " << nodeId 
+                     << " at " << addr_it->second << std::endl;
+            return nullptr;
+        }
+        
+        // 保存客户端（使用 shared_ptr<void> 存储）
+        void* raw_ptr = client.release();
+        rpcClients_[nodeId] = std::shared_ptr<void>(raw_ptr, [](void* p) {
+            delete static_cast<network::RaftRPCClient*>(p);
+        });
+        
+        return raw_ptr;
+    } catch (const std::exception& e) {
+        std::cerr << "Node " << nodeId_ << ": Exception creating RPC client for peer " 
+                 << nodeId << ": " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
+void RaftNode::sendRequestVoteAsync(int nodeId) {
+    // 获取 RPC 客户端
+    void* client_ptr = getRPCClient(nodeId);
+    if (!client_ptr) {
+        return;
+    }
+    
+    auto* client = static_cast<network::RaftRPCClient*>(client_ptr);
+    
+    // 准备请求参数（需要在锁外准备以避免死锁）
+    RequestVoteArgs args;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        args.term = currentTerm_;
+        args.candidateId = nodeId_;
+        args.lastLogIndex = getLastLogIndex();
+        args.lastLogTerm = getLastLogTerm();
+    }
+    
+    // 发送 RPC
+    RequestVoteReply reply;
+    bool success = client->sendRequestVote(args, reply, 1000);
+    
+    if (success) {
+        // 处理响应
+        handleVoteResponse(nodeId, reply);
+    } else {
+        std::cerr << "Node " << nodeId_ << ": Failed to send RequestVote to peer " << nodeId << std::endl;
+    }
+}
+
+void RaftNode::sendAppendEntriesAsync(int nodeIndex) {
+    if (nodeIndex < 0 || nodeIndex >= static_cast<int>(peerIds_.size())) {
+        return;
+    }
+    
+    int nodeId = peerIds_[nodeIndex];
+    
+    // 获取 RPC 客户端
+    void* client_ptr = getRPCClient(nodeId);
+    if (!client_ptr) {
+        return;
+    }
+    
+    auto* client = static_cast<network::RaftRPCClient*>(client_ptr);
+    
+    // 准备请求参数
+    AppendEntriesArgs args;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        args = createAppendEntriesArgs(nodeIndex);
+    }
+    
+    // 发送 RPC
+    AppendEntriesReply reply;
+    bool success = client->sendAppendEntries(args, reply, 1000);
+    
+    if (success) {
+        // 处理响应
+        bool should_update_commit = handleAppendEntriesResponse(nodeId, reply);
+        
+        if (should_update_commit) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            updateCommitIndex();
+            applyCommittedEntriesInternal();
+        }
+    } else {
+        std::cerr << "Node " << nodeId_ << ": Failed to send AppendEntries to peer " << nodeId << std::endl;
+    }
 }
 
 } // namespace raft

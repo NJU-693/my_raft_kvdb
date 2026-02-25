@@ -412,6 +412,11 @@ private:
     std::map<int, std::shared_ptr<PendingCommand>> pendingCommands_;  // 待处理的命令
     std::mutex pendingCommandsMutex_;              // 保护 pendingCommands_
 
+    // ==================== RPC 客户端管理 ====================
+    
+    std::map<int, std::shared_ptr<void>> rpcClients_;  // 对等节点的 RPC 客户端（使用 void* 避免循环依赖）
+    std::mutex rpcClientsMutex_;                       // 保护 rpcClients_
+
     // ==================== 私有辅助方法 ====================
 
     /**
@@ -438,6 +443,25 @@ private:
      * @brief 应用已提交的日志条目到状态机（内部方法，假设调用者已持有锁）
      */
     void applyCommittedEntriesInternal();
+
+    /**
+     * @brief 获取或创建到指定节点的 RPC 客户端
+     * @param nodeId 节点 ID
+     * @return RPC 客户端指针（如果失败返回 nullptr）
+     */
+    void* getRPCClient(int nodeId);
+
+    /**
+     * @brief 向指定节点发送 RequestVote RPC（异步）
+     * @param nodeId 节点 ID
+     */
+    void sendRequestVoteAsync(int nodeId);
+
+    /**
+     * @brief 向指定节点发送 AppendEntries RPC（异步）
+     * @param nodeIndex 节点在 peerIds_ 中的索引
+     */
+    void sendAppendEntriesAsync(int nodeIndex);
 };
 
 } // namespace raft

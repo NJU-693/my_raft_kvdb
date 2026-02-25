@@ -147,9 +147,9 @@ grpc::Status ClientServiceImpl::HandleRequest(
             return grpc::Status::OK;
     }
     
-    // 提交命令到 Raft
+    // 提交命令到 Raft（增加超时时间到 10 秒）
     std::string result;
-    bool success = raft_node_->submitCommand(command, result, 5000);
+    bool success = raft_node_->submitCommand(command, result, 10000);
     
     response->set_success(success);
     response->set_is_leader(true);

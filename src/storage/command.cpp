@@ -66,27 +66,33 @@ Command Command::deserialize(const std::string& str) {
         throw std::invalid_argument("Invalid command type: " + type_str);
     }
     
-    // 提取键
-    size_t second_colon = str.find(':', first_colon + 1);
+    // 提取键和值
     std::string key;
     std::string value;
     
     if (type == CommandType::PUT) {
-        // PUT 命令需要两个冒号
-        if (second_colon == std::string::npos) {
+        // PUT 命令格式: PUT:key:value
+        // 由于 key 可以包含冒号（如 user:1），我们使用最后一个冒号作为 key/value 分隔符
+        // 这样 key 可以包含任意数量的冒号，但 value 不能包含冒号
+        // 
+        // 注意：这是一个权衡。如果 value 也需要包含冒号，则需要使用转义机制或不同的序列化格式
+        
+        // 查找最后一个冒号
+        size_t last_colon = str.rfind(':');
+        if (last_colon == first_colon) {
+            // 只有一个冒号，缺少 value
             throw std::invalid_argument("Invalid PUT command format: missing value");
         }
-        key = str.substr(first_colon + 1, second_colon - first_colon - 1);
-        value = str.substr(second_colon + 1);
+        
+        key = str.substr(first_colon + 1, last_colon - first_colon - 1);
+        value = str.substr(last_colon + 1);
         
         if (key.empty()) {
             throw std::invalid_argument("Key cannot be empty");
         }
     } else {
-        // GET 和 DELETE 命令只需要一个冒号
-        if (second_colon != std::string::npos) {
-            throw std::invalid_argument("Invalid GET/DELETE command format: unexpected colon");
-        }
+        // GET 和 DELETE 命令格式: GET:key 或 DELETE:key
+        // key 可以包含冒号，所以直接取第一个冒号后的所有内容
         key = str.substr(first_colon + 1);
         
         if (key.empty()) {

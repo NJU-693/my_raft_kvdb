@@ -25,10 +25,12 @@ Makefile
 *~
 .DS_Store
 
-# 数据文件
+# 运行时生成的文件
 data/
+logs/
 *.log
 *.dat
+*.pid
 
 # 测试输出
 Testing/
