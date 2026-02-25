@@ -1,10 +1,12 @@
-我观察 kv_client_test 代码下来
+
+---
+我观察 kv_client_test 代码下来（流程是错的
 对于一个外部的客户请求 put 操作 ， 大概流程如下:
 1. 先是客户调用 stub->HandleRequest，调用 grpc 来对kv分布式存储系统进行操作。
 2. 若访问的不是 leader 就重定向 leader 。 
 3. kv分布式存储系统服务器 解析命令，将当前命令 追加到 leader 的待处理命令后面。
 （这里的步骤暂时是单点的系统， 所以我对多node的分布式系统做简单的猜测。我不太了解，以下的流程我结合我学的raft 自行猜测了下）
-4. leader 发送 AppendEntries 这个 rpc 请求，让所有的 follower都更新， 当待处理都复制完成之后。
+4. leader 发送 AppendEntries 这个 rpc 请求，让所有的 follower都更新日志， 当日志都复制完成之后。
 5. leader 调用 submitCommand 将这个待处理命令提交上去（这之后应该时到 日志上了吧？）
 6. 在command确定能提交之后，调用applyCommittedEntriesInternal， 触发回调函数 applyCallback_(entry.command) 这样来落实到 kv存储系统 的更改。
   
@@ -90,8 +92,10 @@ grpc::Status ClientServiceImpl::HandleRequest(...) {
        // 检查日志一致性
        // 追加新条目到本地日志
        log_.push_back(newEntry);
-       
-       // 更新commitIndex
+       //
+       // 这里已经是更新了日志了，知识没有更新commitindex，维护日志一致性，和维护 commitindex是两个东西。
+       //
+       // 更新commitIndex（如果能更新的话 ，将commitindex更新
        if (args.leaderCommit > commitIndex_) {
            commitIndex_ = min(args.leaderCommit, lastLogIndex);
            // ⭐ 应用已提交的日志到KV存储
@@ -102,8 +106,9 @@ grpc::Status ClientServiceImpl::HandleRequest(...) {
 6️⃣ Leader收到多数派ACK后
    updateCommitIndex() {
        // 统计matchIndex_，发现多数节点已复制index=5
+       // 这里是根据日志复制的进度来更新commitindex。如果大多数节点的日志下标都超过了上一个commintindex的下标，那么就认定这些新的日志 可以被commit了。
        commitIndex_ = 5;  // 更新commitIndex
-       
+
        // ⭐ 应用已提交的日志到KV存储
        applyCommittedEntriesInternal();
    }
