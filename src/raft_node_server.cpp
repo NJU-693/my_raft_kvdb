@@ -1,9 +1,61 @@
+// Raft Node Server 主程序
+//
+// 线程架构说明：
+// ================================================================================
+// 本系统采用多线程架构，避免阻塞问题：
+//
+// 1. 【主循环线程】(main thread)
+//    - 检查选举超时
+//    - 触发心跳/日志复制（异步）
+//    - 应用已提交的日志（兜底）
+//    - 每 10ms 循环一次
+//
+// 2. 【gRPC 服务器线程池】(grpc internal thread pool)
+//    - 接收客户端请求 (HandleRequest)
+//    - 接收其他节点的 RPC 请求 (RequestVote, AppendEntries)
+//    - HandleRequest -> submitCommand -> cv.wait_for() 等待日志被应用
+//
+// 3. 【RPC 工作线程池】(g_rpc_pool, 4 threads)
+//    - 发送 RequestVote/AppendEntries RPC 到其他节点
+//    - 处理 RPC 响应 (handleVoteResponse, handleAppendEntriesResponse)
+//    - handleAppendEntriesResponse -> updateCommitIndex -> applyCommittedEntriesInternal
+//    - applyCommittedEntriesInternal -> cv.notify_one() 唤醒等待的 submitCommand
+//
+// 流程示例：
+// --------------------------------------------------------------------------------
+// [客户端请求 KV 操作]
+//   ↓ gRPC 请求
+// [gRPC 工作线程] HandleRequest
+//   ↓ 调用
+// [RaftNode] submitCommand
+//   ↓ 追加日志，创建 PendingCommand，等待 cv.wait_for()
+// 
+// [主循环线程] 检测到需要发送心跳
+//   ↓ 调用
+// sendAppendEntriesToPeers
+//   ↓ 提交任务到 RPC 线程池
+// [RPC 工作线程] 发送 AppendEntries RPC
+//   ↓ 收到 Follower 响应
+// [RPC 工作线程] handleAppendEntriesResponse
+//   ↓ 更新 commitIndex
+// [RPC 工作线程] applyCommittedEntriesInternal
+//   ↓ 应用日志到 KV 存储，设置 PendingCommand.completed = true
+// [RPC 工作线程] cv.notify_one()
+//   ↓ 唤醒
+// [gRPC 工作线程] submitCommand 返回结果
+//   ↓ 返回
+// [gRPC 工作线程] HandleRequest 返回客户端
+// ================================================================================
+
 #include <iostream>
 #include <memory>
 #include <thread>
 #include <chrono>
 #include <csignal>
 #include <atomic>
+#include <queue>
+#include <condition_variable>
+#include <functional>
 #include "raft/raft_node.h"
 #include "storage/kv_store.h"
 #include "storage/persister.h"
@@ -14,6 +66,67 @@
 // 全局变量用于优雅关闭
 std::atomic<bool> g_running(true);
 std::unique_ptr<network::RaftRPCServer> g_server;
+
+// 简单的线程池用于异步 RPC 调用
+class RPCThreadPool {
+public:
+    RPCThreadPool(size_t num_threads) : stop_(false) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+                        
+                        if (stop_ && tasks_.empty()) {
+                            return;
+                        }
+                        
+                        if (!tasks_.empty()) {
+                            task = std::move(tasks_.front());
+                            tasks_.pop();
+                        }
+                    }
+                    
+                    if (task) {
+                        task();
+                    }
+                }
+            });
+        }
+    }
+    
+    ~RPCThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+    
+    void enqueue(std::function<void()> task) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            tasks_.push(std::move(task));
+        }
+        cv_.notify_one();
+    }
+    
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_;
+};
+
+std::unique_ptr<RPCThreadPool> g_rpc_pool;
 
 void signalHandler(int signal) {
     std::cout << "\nReceived signal " << signal << ", shutting down gracefully..." << std::endl;
@@ -39,8 +152,8 @@ void sendRequestVotesToPeers(
     
     // 向每个对等节点发送 RequestVote RPC
     for (const auto& [peer_id, address] : peer_addresses) {
-        // 在新线程中发送 RPC，避免阻塞主循环
-        std::thread([raft_node, peer_id, address, term, node_id, lastLogIndex, lastLogTerm]() {
+        // 使用线程池异步发送 RPC，避免阻塞主循环
+        g_rpc_pool->enqueue([raft_node, peer_id, address, term, node_id, lastLogIndex, lastLogTerm]() {
             auto client = network::createRPCClient(address);
             if (client->connect(address)) {
                 raft::RequestVoteArgs args(term, node_id, lastLogIndex, lastLogTerm);
@@ -52,7 +165,7 @@ void sendRequestVotesToPeers(
                 }
                 client->disconnect();
             }
-        }).detach();
+        });
     }
 }
 
@@ -76,8 +189,8 @@ void sendAppendEntriesToPeers(
         
         const std::string& address = it->second;
         
-        // 在新线程中发送 RPC，避免阻塞主循环
-        std::thread([raft_node, peer_id, address, i]() {
+        // 使用线程池异步发送 RPC，避免阻塞主循环和创建大量线程
+        g_rpc_pool->enqueue([raft_node, peer_id, address, i]() {
             auto client = network::createRPCClient(address);
             if (client->connect(address)) {
                 // 创建 AppendEntries 参数（nodeIndex 是在 peerIds_ 数组中的索引）
@@ -90,7 +203,7 @@ void sendAppendEntriesToPeers(
                 }
                 client->disconnect();
             }
-        }).detach();
+        });
     }
 }
 
@@ -197,6 +310,10 @@ int main(int argc, char* argv[]) {
         }
         std::cout << std::endl;
         
+        // 创建 RPC 线程池（用于异步 RPC 调用）
+        std::cout << "Initializing RPC Thread Pool (4 threads)..." << std::endl;
+        g_rpc_pool = std::make_unique<RPCThreadPool>(4);
+        
         // 创建并启动 RPC 服务器
         std::cout << "Starting RPC Server on " << node_config.getAddress() << "..." << std::endl;
         g_server = network::createRPCServer(raft_node.get());
@@ -218,6 +335,7 @@ int main(int argc, char* argv[]) {
         std::signal(SIGTERM, signalHandler);
         
         // 主循环：定期检查选举超时和发送心跳
+        // 注意：这是主循环线程，与 gRPC 服务器线程和 RPC 工作线程池独立
         auto last_status_print = std::chrono::steady_clock::now();
         const auto status_interval = std::chrono::seconds(5);
         
@@ -225,18 +343,21 @@ int main(int argc, char* argv[]) {
             // 检查选举超时
             if (raft_node->checkElectionTimeout()) {
                 raft_node->startElection();
-                // 向所有对等节点发送投票请求
+                // 向所有对等节点发送投票请求（异步，在 RPC 线程池中执行）
                 sendRequestVotesToPeers(raft_node.get(), node_id, peer_addresses);
             }
             
             // Leader 发送心跳
             if (raft_node->isLeader() && raft_node->shouldSendHeartbeat()) {
-                // 向所有对等节点发送 AppendEntries RPC（心跳）
+                // 向所有对等节点发送 AppendEntries RPC（异步，在 RPC 线程池中执行）
+                // RPC 响应会在线程池中调用 handleAppendEntriesResponse -> updateCommitIndex
                 sendAppendEntriesToPeers(raft_node.get(), peer_ids, peer_addresses);
                 raft_node->resetHeartbeatTimer();
             }
             
-            // 应用已提交的日志
+            // 应用已提交的日志（兜底机制）
+            // 注意：handleAppendEntriesResponse 也会调用 applyCommittedEntriesInternal
+            // 这里作为额外的安全保障，确保日志被及时应用（尤其是 Follower）
             raft_node->applyCommittedEntries();
             
             // 定期打印状态
