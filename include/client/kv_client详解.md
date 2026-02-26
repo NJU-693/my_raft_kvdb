@@ -109,8 +109,10 @@ grpc::Status ClientServiceImpl::HandleRequest(...) {
        // 这里是根据日志复制的进度来更新commitindex。如果大多数节点的日志下标都超过了上一个commintindex的下标，那么就认定这些新的日志 可以被commit了。
        commitIndex_ = 5;  // 更新commitIndex
 
-       // ⭐ 应用已提交的日志到KV存储
-       applyCommittedEntriesInternal();
+       // 这一步在我的最新代码中注释了，这里 在持锁状态下执行状态机应用，可能造成长时间持锁。
+       // 具体看源代码即可
+       // // ⭐ 应用已提交的日志到KV存储
+       // applyCommittedEntriesInternal();
    }
    
 7️⃣ 应用到状态机 (raft_node.cpp:491)
