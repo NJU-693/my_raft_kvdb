@@ -622,14 +622,17 @@ void RaftNode::updateCommitIndex() {
         }
     }
     
+
+    // 把这里注释了
+    // 如果在这里直接调用 applyCommittedEntriesInternal()，可能会导致 Leader 在处理 AppendEntries 响应时长时间持锁，从而阻塞其他重要操作（如处理客户端请求、发送心跳等）。
+    // 通过让上层应用（如 server）主动调用 applyCommittedEntries()，可以在适当的时机应用已提交的日志条目，同时避免在 Raft 内部持锁执行耗时操作。
     // 如果 commitIndex 有更新，立即应用
-    if (commitIndex_ > oldCommitIndex) {
-        std::cout << "[updateCommitIndex] commitIndex updated from " << oldCommitIndex 
-                  << " to " << commitIndex_ << ", applying entries on LEADER" << std::endl;
-        applyCommittedEntriesInternal();
-    } else {
-        std::cout << "[updateCommitIndex] No update to commitIndex" << std::endl;
-    }
+    // if (commitIndex_ > oldCommitIndex) {
+        // std::cout << "[updateCommitIndex] commitIndex updated from " << oldCommitIndex 
+        //           << " to " << commitIndex_ << ", applying entries on LEADER" << std::endl;
+        // applyCommittedEntriesInternal();
+        //
+    // }
 }
 
 AppendEntriesArgs RaftNode::createAppendEntriesArgs(int nodeIndex) const {
