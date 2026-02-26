@@ -459,6 +459,10 @@ int main() {
         testOutdatedVoteResponse();
         
         std::cout << "\n=== All Tests Passed! ===" << std::endl;
+        
+        // 等待所有后台线程完成，避免析构时段错误
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "\nTest failed with exception: " << e.what() << std::endl;

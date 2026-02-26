@@ -20,6 +20,7 @@ RaftNode::RaftNode(int nodeId, const std::vector<int>& peerIds)
       lastHeartbeatTime_(std::chrono::steady_clock::now()),
       lastHeartbeatSent_(std::chrono::steady_clock::now()),
       heartbeatInterval_(HEARTBEAT_INTERVAL),
+      shuttingDown_(false),
       rng_(std::random_device{}()) {
     
     // 初始化日志（索引 0 为哨兵）
@@ -34,7 +35,16 @@ RaftNode::RaftNode(int nodeId, const std::vector<int>& peerIds)
 }
 
 RaftNode::~RaftNode() {
-    // 清理资源
+    // 设置关闭标志，防止新的后台线程访问对象
+    shuttingDown_.store(true);
+    
+    // 等待一小段时间让已启动的后台线程完成
+    // 这些线程在访问成员前会检查 shuttingDown_ 标志
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 清理 RPC 客户端
+    std::lock_guard<std::mutex> lock(rpcClientsMutex_);
+    rpcClients_.clear();
 }
 
 // ==================== 状态查询接口 ====================
@@ -201,12 +211,12 @@ void RaftNode::startElection() {
     // 重置选举超时
     resetElectionTimer();
     
-    // 向所有对等节点发送 RequestVote RPC
-    for (size_t i = 0; i < peerIds_.size(); ++i) {
-        std::thread([this, i]() {
-            sendRequestVoteAsync(peerIds_[i]);
-        }).detach();
-    }
+    // // 向所有对等节点发送 RequestVote RPC
+    // for (size_t i = 0; i < peerIds_.size(); ++i) {
+    //     std::thread([this, i]() {
+    //         sendRequestVoteAsync(peerIds_[i]);
+    //     }).detach();
+    // }
 }
 
 bool RaftNode::handleVoteResponse(int nodeId, const RequestVoteReply& reply) {
@@ -408,6 +418,11 @@ void RaftNode::replicateLog() {
         return;
     }
     
+    // 检查是否正在关闭
+    if (shuttingDown_.load()) {
+        return;
+    }
+    
     // 向所有对等节点发送 AppendEntries RPC
     for (size_t i = 0; i < peerIds_.size(); ++i) {
         std::thread([this, i]() {
@@ -580,9 +595,6 @@ void RaftNode::updateCommitIndex() {
     if (state_ != NodeState::LEADER) {
         return;
     }
-    
-    // 保存旧的 commitIndex 以便检测是否有更新
-    int oldCommitIndex = commitIndex_;
     
     // 找到可以提交的最高日志索引
     // 需要多数节点都已复制的日志条目
@@ -869,6 +881,11 @@ void* RaftNode::getRPCClient(int nodeId) {
 }
 
 void RaftNode::sendRequestVoteAsync(int nodeId) {
+    // 检查是否正在关闭
+    if (shuttingDown_.load()) {
+        return;
+    }
+    
     // 获取 RPC 客户端
     void* client_ptr = getRPCClient(nodeId);
     if (!client_ptr) {
@@ -900,6 +917,11 @@ void RaftNode::sendRequestVoteAsync(int nodeId) {
 }
 
 void RaftNode::sendAppendEntriesAsync(int nodeIndex) {
+    // 检查是否正在关闭
+    if (shuttingDown_.load()) {
+        return;
+    }
+    
     if (nodeIndex < 0 || nodeIndex >= static_cast<int>(peerIds_.size())) {
         return;
     }

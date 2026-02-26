@@ -72,20 +72,17 @@ Command Command::deserialize(const std::string& str) {
     
     if (type == CommandType::PUT) {
         // PUT 命令格式: PUT:key:value
-        // 由于 key 可以包含冒号（如 user:1），我们使用最后一个冒号作为 key/value 分隔符
-        // 这样 key 可以包含任意数量的冒号，但 value 不能包含冒号
-        // 
-        // 注意：这是一个权衡。如果 value 也需要包含冒号，则需要使用转义机制或不同的序列化格式
+        // 查找第二个冒号，它是 key 和 value 的分隔符
+        // 这样 key 不能包含冒号，但 value 可以包含任意数量的冒号
         
-        // 查找最后一个冒号
-        size_t last_colon = str.rfind(':');
-        if (last_colon == first_colon) {
+        size_t second_colon = str.find(':', first_colon + 1);
+        if (second_colon == std::string::npos) {
             // 只有一个冒号，缺少 value
             throw std::invalid_argument("Invalid PUT command format: missing value");
         }
         
-        key = str.substr(first_colon + 1, last_colon - first_colon - 1);
-        value = str.substr(last_colon + 1);
+        key = str.substr(first_colon + 1, second_colon - first_colon - 1);
+        value = str.substr(second_colon + 1);
         
         if (key.empty()) {
             throw std::invalid_argument("Key cannot be empty");
