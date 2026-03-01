@@ -285,30 +285,25 @@ int main(int argc, char* argv[]) {
         raft_node->setNodeAddress(node_config.getAddress());
         raft_node->setPeerAddresses(peer_addresses);
         
-        // 设置状态机应用回调
-        raft_node->setApplyCallback([kv_store](const std::string& command) -> std::string {
-            return kv_store->applyCommandWithResult(command);
-        });
-        
         // 创建持久化器
         std::cout << "Initializing Persister..." << std::endl;
         auto persister = std::make_shared<storage::Persister>(node_config.data_dir);
         
-        // 尝试从持久化存储恢复状态
-        int current_term = 0;
-        int voted_for = -1;
-        std::vector<raft::LogEntry> log;
+        // 设置持久化器到 RaftNode
+        raft_node->setPersister(persister.get());
         
-        if (persister->loadRaftState(current_term, voted_for, log)) {
-            std::cout << "Recovered state from persistent storage:" << std::endl;
-            std::cout << "  Term: " << current_term << std::endl;
-            std::cout << "  Voted For: " << voted_for << std::endl;
-            std::cout << "  Log Entries: " << log.size() << std::endl;
-            // TODO: 将恢复的状态应用到 RaftNode
+        // 尝试从持久化存储恢复状态
+        if (raft_node->restoreState()) {
+            std::cout << "State restored from persistent storage" << std::endl;
         } else {
             std::cout << "No previous state found, starting fresh" << std::endl;
         }
         std::cout << std::endl;
+        
+        // 设置状态机应用回调
+        raft_node->setApplyCallback([kv_store](const std::string& command) -> std::string {
+            return kv_store->applyCommandWithResult(command);
+        });
         
         // 创建 RPC 线程池（用于异步 RPC 调用）
         std::cout << "Initializing RPC Thread Pool (4 threads)..." << std::endl;

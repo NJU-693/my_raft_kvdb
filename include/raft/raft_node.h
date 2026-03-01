@@ -13,6 +13,11 @@
 #include <functional>
 #include <condition_variable>
 
+// 前向声明
+namespace storage {
+    class Persister;
+}
+
 namespace raft {
 
 /**
@@ -336,6 +341,26 @@ public:
      */
     void setPeerAddresses(const std::map<int, std::string>& peer_addresses);
 
+    // ==================== 持久化接口 ====================
+
+    /**
+     * @brief 设置持久化器
+     * @param persister 持久化器指针
+     * 
+     * 需求: 2.1.3 (安全性保证 - 持久化存储)
+     */
+    void setPersister(storage::Persister* persister);
+
+    /**
+     * @brief 从持久化存储恢复状态
+     * @return 是否成功恢复状态
+     * 
+     * 在节点启动时调用，从磁盘恢复 currentTerm、votedFor 和 log。
+     * 
+     * 需求: 2.1.3 (安全性保证 - 持久化存储)
+     */
+    bool restoreState();
+
 private:
     // ==================== 持久化状态（所有服务器）====================
     // 需求: 2.1.3 (安全性保证 - 持久化存储)
@@ -417,6 +442,18 @@ private:
     
     std::map<int, std::shared_ptr<void>> rpcClients_;  // 对等节点的 RPC 客户端（使用 void* 避免循环依赖）
     std::mutex rpcClientsMutex_;                       // 保护 rpcClients_
+
+    // ==================== 持久化 ====================
+    
+    storage::Persister* persister_;                    // 持久化器指针（不拥有所有权）
+
+    /**
+     * @brief 持久化当前状态到磁盘
+     * 
+     * 保存 currentTerm、votedFor 和 log 到持久化存储。
+     * 注意：此方法假设调用者已持有锁。
+     */
+    void persistState();
 
     // ==================== 私有辅助方法 ====================
 

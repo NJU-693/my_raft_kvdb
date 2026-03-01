@@ -274,25 +274,286 @@ Leader 提交日志的条件：
 
 ### 6.1 需要持久化的状态
 
-**所有节点**:
-- `currentTerm`: 当前任期
-- `votedFor`: 当前任期投票给了谁
+**所有节点必须持久化**：
+- `currentTerm`: 当前任期号
+- `votedFor`: 当前任期投票给了谁（节点 ID 或 -1）
 - `log[]`: 日志条目数组
 
-### 6.2 持久化时机
+**为什么需要持久化这些状态？**
 
-- 任期号变化时
-- 投票时
-- 追加日志时
+1. **currentTerm**：
+   - 防止节点重启后使用过时的任期号
+   - 保证任期号单调递增
+   - 避免重复投票
 
-### 6.3 崩溃恢复
+2. **votedFor**：
+   - 防止在同一任期内投票给多个候选人
+   - 保证每个任期最多一个 Leader
 
-节点重启后：
+3. **log[]**：
+   - 保证已提交的日志不会丢失
+   - 恢复后能够重放日志到状态机
+
+### 6.2 持久化实现
+
+**Persister 类**：
+
+```cpp
+class Persister {
+public:
+    void saveRaftState(const std::string& state);
+    std::string readRaftState();
+    
+private:
+    std::string filename_;
+    std::mutex mutex_;
+};
 ```
-1. 从持久化存储恢复状态
+
+**序列化格式**：
+
+```
+[4 bytes: currentTerm]
+[4 bytes: votedFor]
+[4 bytes: log size]
+[log entries...]
+```
+
+每个日志条目：
+```
+[4 bytes: term]
+[4 bytes: index]
+[4 bytes: command length]
+[command data...]
+```
+
+### 6.3 持久化时机
+
+**必须在响应 RPC 之前持久化**：
+
+```cpp
+// 错误示例：先响应再持久化
+reply.voteGranted = true;
+persistState();  // 太晚了！
+return reply;
+
+// 正确示例：先持久化再响应
+currentTerm = args.term;
+votedFor = args.candidateId;
+persistState();  // 在响应之前
+reply.voteGranted = true;
+return reply;
+```
+
+**持久化触发点**：
+
+1. **任期号变化**：
+```cpp
+void RaftNode::setCurrentTerm(int term) {
+    currentTerm = term;
+    persistState();  // 立即持久化
+}
+```
+
+2. **投票时**：
+```cpp
+RequestVoteReply RaftNode::handleRequestVote(const RequestVoteArgs& args) {
+    if (/* 决定投票 */) {
+        votedFor = args.candidateId;
+        persistState();  // 投票前持久化
+    }
+    // ...
+}
+```
+
+3. **追加日志时**：
+```cpp
+void RaftNode::appendLogEntry(const LogEntry& entry) {
+    log.push_back(entry);
+    persistState();  // 日志修改后持久化
+}
+```
+
+### 6.4 崩溃恢复
+
+**恢复流程**：
+
+```cpp
+void RaftNode::restoreState() {
+    std::string state = persister_->readRaftState();
+    if (state.empty()) {
+        // 首次启动，使用默认值
+        currentTerm = 0;
+        votedFor = -1;
+        log.clear();
+        return;
+    }
+    
+    // 反序列化状态
+    deserialize(state, currentTerm, votedFor, log);
+    
+    // 重放日志到状态机
+    for (int i = lastApplied + 1; i <= commitIndex; i++) {
+        applyLogEntry(log[i]);
+    }
+}
+```
+
+**启动后的行为**：
+
+1. 恢复持久化状态
 2. 以 Follower 身份启动
 3. 等待 Leader 的心跳或发起选举
 4. 通过日志复制同步缺失的日志
+
+**示例场景**：
+
+```
+初始状态：
+Node 1 (Leader): Term=5, Log=[1,2,3,4,5]
+Node 2 (Follower): Term=5, Log=[1,2,3,4,5]
+Node 3 (Follower): Term=5, Log=[1,2,3,4,5]
+
+Node 2 崩溃并重启：
+1. 从磁盘读取：Term=5, votedFor=-1, Log=[1,2,3,4,5]
+2. 以 Follower 身份启动
+3. 收到 Leader 的心跳（Term=5）
+4. 检查日志一致性
+5. 如果有新日志，通过 AppendEntries 追赶
+6. 恢复正常服务
+```
+
+### 6.5 性能优化
+
+**批量持久化**：
+
+```cpp
+// 不推荐：每次修改都持久化
+for (auto& entry : entries) {
+    log.push_back(entry);
+    persistState();  // 多次 I/O
+}
+
+// 推荐：批量修改后一次持久化
+for (auto& entry : entries) {
+    log.push_back(entry);
+}
+persistState();  // 一次 I/O
+```
+
+**异步持久化**（高级）：
+
+```cpp
+// 使用后台线程持久化
+void RaftNode::persistStateAsync() {
+    std::string state = serializeState();
+    persistQueue_.push(state);
+    // 后台线程从队列取出并写入磁盘
+}
+```
+
+**注意**：异步持久化需要仔细设计，确保不违反 Raft 的安全性保证。
+
+### 6.6 数据完整性
+
+**原子写入**：
+
+```cpp
+void Persister::saveRaftState(const std::string& state) {
+    // 1. 写入临时文件
+    std::string tmpFile = filename_ + ".tmp";
+    std::ofstream ofs(tmpFile, std::ios::binary);
+    ofs.write(state.data(), state.size());
+    ofs.close();
+    
+    // 2. fsync 确保落盘
+    int fd = open(tmpFile.c_str(), O_RDONLY);
+    fsync(fd);
+    close(fd);
+    
+    // 3. 原子重命名
+    rename(tmpFile.c_str(), filename_.c_str());
+}
+```
+
+**校验和**（可选）：
+
+```cpp
+struct PersistedState {
+    uint32_t checksum;  // CRC32 校验和
+    int currentTerm;
+    int votedFor;
+    std::vector<LogEntry> log;
+};
+```
+
+### 6.7 测试验证
+
+**崩溃恢复测试**：
+
+```bash
+# 1. 启动集群并写入数据
+./scripts/start_cluster.sh
+./build/bin/kv_client_cli PUT key1 value1
+
+# 2. 停止节点
+kill $(cat logs/node2.pid)
+
+# 3. 继续写入数据
+./build/bin/kv_client_cli PUT key2 value2
+
+# 4. 重启节点
+./build/bin/raft_node_server 2 config/cluster.conf &
+
+# 5. 验证数据
+./build/bin/kv_client_cli GET key1  # 应该返回 value1
+./build/bin/kv_client_cli GET key2  # 应该返回 value2
+```
+
+**测试结果**（基于实际测试）：
+- 恢复时间：< 3 秒
+- 追赶时间：< 5 秒（7 个操作）
+- 成功率：100%（7/7 操作验证通过）
+- 文件大小：约 340 字节（小规模日志）
+
+详细测试报告见 [崩溃恢复测试结果](task-9.2.4-crash-recovery-test-results.md)。
+
+### 6.8 常见错误
+
+**错误 1：忘记持久化**
+
+```cpp
+// 错误：修改状态但不持久化
+currentTerm++;
+// 崩溃后 currentTerm 丢失
+```
+
+**错误 2：持久化时机错误**
+
+```cpp
+// 错误：先响应再持久化
+reply.success = true;
+persistState();  // 太晚了
+return reply;
+```
+
+**错误 3：不完整的持久化**
+
+```cpp
+// 错误：只持久化部分状态
+void persistState() {
+    // 只保存 currentTerm，忘记 votedFor 和 log
+    saveInt(currentTerm);
+}
+```
+
+**错误 4：不原子的写入**
+
+```cpp
+// 错误：直接覆盖文件
+std::ofstream ofs(filename_);
+ofs << state;
+// 崩溃时文件可能损坏
 ```
 
 ## 7. 客户端交互

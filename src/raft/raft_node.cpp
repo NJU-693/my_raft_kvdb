@@ -1,4 +1,5 @@
 #include "raft/raft_node.h"
+#include "storage/persister.h"
 #include "network/rpc_client.h"
 #include <algorithm>
 #include <condition_variable>
@@ -21,7 +22,8 @@ RaftNode::RaftNode(int nodeId, const std::vector<int>& peerIds)
       lastHeartbeatSent_(std::chrono::steady_clock::now()),
       heartbeatInterval_(HEARTBEAT_INTERVAL),
       shuttingDown_(false),
-      rng_(std::random_device{}()) {
+      rng_(std::random_device{}()),
+      persister_(nullptr) {
     
     // 初始化日志（索引 0 为哨兵）
     log_.push_back(LogEntry(0, "", 0));
@@ -92,6 +94,7 @@ void RaftNode::handleRequestVote(const RequestVoteArgs& args, RequestVoteReply& 
         votesReceived_.clear();
         currentElectionTerm_ = -1;
         reply.term = currentTerm_;
+        persistState();  // 持久化状态变更
     }
     
     // 规则 3: 检查投票条件
@@ -104,6 +107,7 @@ void RaftNode::handleRequestVote(const RequestVoteArgs& args, RequestVoteReply& 
         votedFor_ = args.candidateId;
         reply.voteGranted = true;
         resetElectionTimer();  // 重置选举超时
+        persistState();  // 持久化投票决定
     }
 }
 
@@ -133,6 +137,7 @@ void RaftNode::handleAppendEntries(const AppendEntriesArgs& args, AppendEntriesR
         leaderId_ = args.leaderId;
         resetElectionTimer();  // 重置选举超时
         reply.term = currentTerm_;
+        persistState();  // 持久化状态变更
     }
     
     // 规则 3: 检查日志一致性
@@ -160,6 +165,7 @@ void RaftNode::handleAppendEntries(const AppendEntriesArgs& args, AppendEntriesR
     
     // 规则 4: 如果存在冲突的日志条目，删除它及其后的所有条目
     int logIndex = args.prevLogIndex + 1;
+    bool logModified = false;
     for (size_t i = 0; i < args.entries.size(); ++i) {
         int currentIndex = logIndex + i;
         
@@ -172,6 +178,7 @@ void RaftNode::handleAppendEntries(const AppendEntriesArgs& args, AppendEntriesR
                 LogEntry newEntry = args.entries[i];
                 newEntry.index = currentIndex;  // 确保索引正确
                 log_.push_back(newEntry);
+                logModified = true;
             }
             // 如果不冲突，跳过（已存在相同的条目）
         } else {
@@ -179,7 +186,13 @@ void RaftNode::handleAppendEntries(const AppendEntriesArgs& args, AppendEntriesR
             LogEntry newEntry = args.entries[i];
             newEntry.index = currentIndex;  // 确保索引正确
             log_.push_back(newEntry);
+            logModified = true;
         }
+    }
+    
+    // 如果日志被修改，持久化
+    if (logModified) {
+        persistState();
     }
     
     // 规则 5: 更新 commitIndex
@@ -202,6 +215,9 @@ void RaftNode::startElection() {
     currentTerm_++;
     votedFor_ = nodeId_;  // 投票给自己
     leaderId_ = -1;
+    
+    // 持久化状态变更（任期和投票）
+    persistState();
     
     // 初始化选举状态
     currentElectionTerm_ = currentTerm_;
@@ -236,6 +252,7 @@ bool RaftNode::handleVoteResponse(int nodeId, const RequestVoteReply& reply) {
         leaderId_ = -1;
         votesReceived_.clear();
         resetElectionTimer();
+        persistState();  // 持久化状态变更
         return false;
     }
     
@@ -298,6 +315,7 @@ void RaftNode::becomeFollower(int term) {
     if (term > currentTerm_) {
         currentTerm_ = term;
         votedFor_ = -1;
+        persistState();  // 持久化状态变更
     }
     
     // 转变为 Follower
@@ -365,6 +383,9 @@ int RaftNode::appendLogEntry(const std::string& command) {
     int index = log_.size();
     LogEntry entry(currentTerm_, command, index);
     log_.push_back(entry);
+    
+    // 持久化新日志条目
+    persistState();
     
     return index;
 }
@@ -471,6 +492,7 @@ bool RaftNode::handleAppendEntriesResponse(int nodeId, const AppendEntriesReply&
         leaderId_ = -1;
         votesReceived_.clear();
         resetElectionTimer();
+        persistState();  // 持久化状态变更
         return false;
     }
     
@@ -958,6 +980,59 @@ void RaftNode::sendAppendEntriesAsync(int nodeIndex) {
         }
     } else {
         std::cerr << "Node " << nodeId_ << ": Failed to send AppendEntries to peer " << nodeId << std::endl;
+    }
+}
+
+// ==================== 持久化接口 ====================
+
+void RaftNode::setPersister(storage::Persister* persister) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    persister_ = persister;
+}
+
+bool RaftNode::restoreState() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    if (!persister_) {
+        std::cout << "[restoreState] No persister set, starting with fresh state" << std::endl;
+        return false;
+    }
+    
+    int restoredTerm = 0;
+    int restoredVotedFor = -1;
+    std::vector<LogEntry> restoredLog;
+    
+    if (persister_->loadRaftState(restoredTerm, restoredVotedFor, restoredLog)) {
+        currentTerm_ = restoredTerm;
+        votedFor_ = restoredVotedFor;
+        
+        // 恢复日志（保留哨兵节点）
+        if (!restoredLog.empty()) {
+            log_ = restoredLog;
+        }
+        
+        std::cout << "[restoreState] State restored from disk:" << std::endl;
+        std::cout << "  Term: " << currentTerm_ << std::endl;
+        std::cout << "  VotedFor: " << votedFor_ << std::endl;
+        std::cout << "  Log entries: " << (log_.size() - 1) << std::endl;
+        
+        return true;
+    }
+    
+    std::cout << "[restoreState] No previous state found, starting fresh" << std::endl;
+    return false;
+}
+
+void RaftNode::persistState() {
+    // 注意：此方法假设调用者已持有锁
+    
+    if (!persister_) {
+        return;  // 没有设置持久化器，跳过
+    }
+    
+    // 保存当前状态
+    if (!persister_->saveRaftState(currentTerm_, votedFor_, log_)) {
+        std::cerr << "[persistState] Failed to persist state!" << std::endl;
     }
 }
 

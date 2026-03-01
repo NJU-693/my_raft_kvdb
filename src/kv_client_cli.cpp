@@ -6,8 +6,15 @@
 #include "util/config.h"
 
 void printUsage(const char* program_name) {
-    std::cout << "Usage: " << program_name << " [config_file]" << std::endl;
-    std::cout << "  config_file: Path to cluster configuration file (default: config/cluster.conf)" << std::endl;
+    std::cout << "Usage: " << program_name << " [command] [args...] [config_file]" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Interactive mode:" << std::endl;
+    std::cout << "  " << program_name << " [config_file]" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Non-interactive mode:" << std::endl;
+    std::cout << "  " << program_name << " PUT <key> <value> [config_file]" << std::endl;
+    std::cout << "  " << program_name << " GET <key> [config_file]" << std::endl;
+    std::cout << "  " << program_name << " DELETE <key> [config_file]" << std::endl;
     std::cout << std::endl;
     std::cout << "Commands:" << std::endl;
     std::cout << "  put <key> <value>  - Store a key-value pair" << std::endl;
@@ -18,8 +25,128 @@ void printUsage(const char* program_name) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string config_file = (argc >= 2) ? argv[1] : "config/cluster.conf";
+    // 检查是否为非交互模式（命令行参数）
+    bool interactive_mode = true;
+    std::string config_file = "config/cluster.conf";
+    std::string command;
+    std::vector<std::string> args;
     
+    if (argc >= 2) {
+        std::string first_arg = argv[1];
+        // 转换为大写以便比较
+        std::string upper_arg = first_arg;
+        for (auto& c : upper_arg) c = std::toupper(c);
+        
+        if (upper_arg == "PUT" || upper_arg == "GET" || upper_arg == "DELETE") {
+            // 非交互模式
+            interactive_mode = false;
+            command = upper_arg;
+            
+            // 收集参数
+            for (int i = 2; i < argc; ++i) {
+                args.push_back(argv[i]);
+            }
+            
+            // 最后一个参数可能是配置文件（如果它看起来像文件路径）
+            if (!args.empty()) {
+                std::string last_arg = args.back();
+                if (last_arg.find(".conf") != std::string::npos || 
+                    last_arg.find("/") != std::string::npos) {
+                    config_file = last_arg;
+                    args.pop_back();
+                }
+            }
+        } else {
+            // 交互模式，第一个参数是配置文件
+            config_file = argv[1];
+        }
+    }
+    
+    // 非交互模式：静默输出
+    if (!interactive_mode) {
+        // 加载配置
+        util::ClusterConfig config;
+        if (!config.loadFromFile(config_file)) {
+            std::cerr << "Failed to load configuration from " << config_file << std::endl;
+            return 1;
+        }
+        
+        // 获取所有节点地址
+        std::vector<std::string> server_addresses;
+        auto all_nodes = config.getAllNodes();
+        
+        for (const auto& node : all_nodes) {
+            server_addresses.push_back(node.getAddress());
+        }
+        
+        // 创建客户端
+        client::KVClient kv_client(server_addresses);
+        kv_client.setTimeout(5000);  // 5 秒超时
+        kv_client.setMaxRetries(3);
+        
+        if (!kv_client.connect()) {
+            std::cerr << "Failed to connect to cluster" << std::endl;
+            return 1;
+        }
+        
+        // 执行命令
+        bool success = false;
+        
+        if (command == "PUT") {
+            if (args.size() < 2) {
+                std::cerr << "Usage: " << argv[0] << " PUT <key> <value>" << std::endl;
+                return 1;
+            }
+            std::string key = args[0];
+            std::string value = args[1];
+            
+            // 如果有更多参数，将它们连接到 value
+            for (size_t i = 2; i < args.size(); ++i) {
+                value += " " + args[i];
+            }
+            
+            success = kv_client.put(key, value);
+            if (success) {
+                std::cout << "OK" << std::endl;
+            } else {
+                std::cerr << "Error: " << kv_client.getLastError() << std::endl;
+            }
+        }
+        else if (command == "GET") {
+            if (args.empty()) {
+                std::cerr << "Usage: " << argv[0] << " GET <key>" << std::endl;
+                return 1;
+            }
+            std::string key = args[0];
+            std::string value;
+            
+            success = kv_client.get(key, value);
+            if (success) {
+                std::cout << value << std::endl;
+            } else {
+                std::cerr << "Error: " << kv_client.getLastError() << std::endl;
+            }
+        }
+        else if (command == "DELETE") {
+            if (args.empty()) {
+                std::cerr << "Usage: " << argv[0] << " DELETE <key>" << std::endl;
+                return 1;
+            }
+            std::string key = args[0];
+            
+            success = kv_client.remove(key);
+            if (success) {
+                std::cout << "OK" << std::endl;
+            } else {
+                std::cerr << "Error: " << kv_client.getLastError() << std::endl;
+            }
+        }
+        
+        kv_client.disconnect();
+        return success ? 0 : 1;
+    }
+    
+    // 交互模式
     std::cout << "========================================" << std::endl;
     std::cout << "  Raft KV Store Client" << std::endl;
     std::cout << "========================================" << std::endl;

@@ -5,9 +5,12 @@
 ## 前置条件
 
 确保已安装：
-- C++17 编译器
+- C++17 编译器（GCC 7+ 或 Clang 6+）
 - CMake 3.14+
 - gRPC 和 Protocol Buffers
+- pthread 库
+
+详细安装说明请参考 [BUILD.md](BUILD.md)。
 
 ## 步骤 1：编译项目
 
