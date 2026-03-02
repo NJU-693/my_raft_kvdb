@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <condition_variable>
+#include <thread>
 
 // 前向声明
 namespace storage {
@@ -361,6 +362,14 @@ public:
      */
     bool restoreState();
 
+    /**
+     * @brief 后台持久化线程函数
+     * 
+     * 定期检查是否需要持久化，如果需要则批量持久化。
+     * 这样可以避免每次追加日志都同步持久化，提升性能。
+     */
+    void persistThreadFunc();
+
 private:
     // ==================== 持久化状态（所有服务器）====================
     // 需求: 2.1.3 (安全性保证 - 持久化存储)
@@ -446,6 +455,9 @@ private:
     // ==================== 持久化 ====================
     
     storage::Persister* persister_;                    // 持久化器指针（不拥有所有权）
+    std::atomic<bool> needsPersist_;                   // 是否需要持久化
+    std::thread persistThread_;                        // 后台持久化线程
+    std::atomic<bool> persistThreadRunning_;           // 持久化线程是否运行
 
     /**
      * @brief 持久化当前状态到磁盘

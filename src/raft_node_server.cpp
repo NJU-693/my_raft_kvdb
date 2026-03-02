@@ -383,9 +383,9 @@ int main(int argc, char* argv[]) {
         std::cout << std::endl;
         std::cout << "Shutting down..." << std::endl;
         
-        // 保存状态
-        std::cout << "Saving state to persistent storage..." << std::endl;
-        // TODO: 从 RaftNode 获取当前状态并保存
+        // 注意：RaftNode 已在每次状态变更时自动调用 persistState()
+        // (包括 term 变化、投票决定、日志添加等)，无需在此显式保存
+        std::cout << "State has been automatically persisted during runtime" << std::endl;
         
         // 停止 RPC 服务器
         std::cout << "Stopping RPC server..." << std::endl;

@@ -23,7 +23,9 @@ RaftNode::RaftNode(int nodeId, const std::vector<int>& peerIds)
       heartbeatInterval_(HEARTBEAT_INTERVAL),
       shuttingDown_(false),
       rng_(std::random_device{}()),
-      persister_(nullptr) {
+      persister_(nullptr),
+      needsPersist_(false),
+      persistThreadRunning_(false) {
     
     // 初始化日志（索引 0 为哨兵）
     log_.push_back(LogEntry(0, "", 0));
@@ -34,11 +36,23 @@ RaftNode::RaftNode(int nodeId, const std::vector<int>& peerIds)
     
     // 生成随机选举超时时间
     electionTimeout_ = generateElectionTimeout();
+    
+    // 启动后台持久化线程
+    persistThreadRunning_.store(true, std::memory_order_release);
+    persistThread_ = std::thread(&RaftNode::persistThreadFunc, this);
+    
+    std::cout << "[RaftNode] Node " << nodeId_ << " initialized with async persistence" << std::endl;
 }
 
 RaftNode::~RaftNode() {
     // 设置关闭标志，防止新的后台线程访问对象
     shuttingDown_.store(true);
+    
+    // 停止持久化线程
+    persistThreadRunning_.store(false, std::memory_order_release);
+    if (persistThread_.joinable()) {
+        persistThread_.join();
+    }
     
     // 等待一小段时间让已启动的后台线程完成
     // 这些线程在访问成员前会检查 shuttingDown_ 标志
@@ -47,6 +61,8 @@ RaftNode::~RaftNode() {
     // 清理 RPC 客户端
     std::lock_guard<std::mutex> lock(rpcClientsMutex_);
     rpcClients_.clear();
+    
+    std::cout << "[RaftNode] Node " << nodeId_ << " destroyed" << std::endl;
 }
 
 // ==================== 状态查询接口 ====================
@@ -384,8 +400,8 @@ int RaftNode::appendLogEntry(const std::string& command) {
     LogEntry entry(currentTerm_, command, index);
     log_.push_back(entry);
     
-    // 持久化新日志条目
-    persistState();
+    // ✅ 异步持久化：只设置标志，不阻塞
+    needsPersist_.store(true, std::memory_order_release);
     
     return index;
 }
@@ -1021,6 +1037,36 @@ bool RaftNode::restoreState() {
     
     std::cout << "[restoreState] No previous state found, starting fresh" << std::endl;
     return false;
+}
+
+void RaftNode::persistThreadFunc() {
+    std::cout << "[PersistThread] Node " << nodeId_ << " persistence thread started" << std::endl;
+    
+    while (persistThreadRunning_.load(std::memory_order_acquire)) {
+        // 检查是否需要持久化
+        if (needsPersist_.load(std::memory_order_acquire)) {
+            // 批量持久化
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                persistState();
+            }
+            needsPersist_.store(false, std::memory_order_release);
+            
+            std::cout << "[PersistThread] Node " << nodeId_ << " persisted state" << std::endl;
+        }
+        
+        // 短暂休眠（10ms），避免过于频繁的检查
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    // 线程退出前，确保所有待持久化的数据都已写入
+    if (needsPersist_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        persistState();
+        std::cout << "[PersistThread] Node " << nodeId_ << " final persist on shutdown" << std::endl;
+    }
+    
+    std::cout << "[PersistThread] Node " << nodeId_ << " persistence thread stopped" << std::endl;
 }
 
 void RaftNode::persistState() {
